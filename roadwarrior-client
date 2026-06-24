@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SWANCTL_DIR="/etc/swanctl"
+RW_CONF="${SWANCTL_DIR}/roadwarrior.conf"
+
+# load config written by setup.sh
+if [[ ! -f "${RW_CONF}" ]]; then
+  echo "ERROR: ${RW_CONF} not found - run setup.sh first" >&2; exit 1
+fi
+. "${RW_CONF}"
+
+if [[ ! -x "$PKI" ]]; then
+  echo "ERROR: pki binary not found at ${PKI}" >&2; exit 1
+fi
+
+# mobileconfig need unique identifiers
+new_uuid() {
+  if command -v uuidgen &>/dev/null; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  else
+    cat /proc/sys/kernel/random/uuid
+  fi
+}
+
+# generate mobileconfig for an existing client
+# gen_mobileconfig <name> [embed-password]
+gen_mobileconfig() {
+  local name="$1"
+  local embed="${2:-no}"
+  local client_pass="${3:-}"
+  local dist_dir="${SWANCTL_DIR}/dist/${name}"
+  local mc_file="${dist_dir}/${name}.mobileconfig"
+
+  if [[ ! -f "${dist_dir}/${name}.p12" ]]; then
+    echo "ERROR: missing ${name}.p12 - run 'add' first" >&2; exit 1
+  fi
+  if [[ ! -f "${SWANCTL_DIR}/x509ca/caCert.der" ]]; then
+    echo "ERROR: missing caCert.der - run setup.sh first" >&2; exit 1
+  fi
+
+  local uuid_pkcs12 uuid_vpnconfig uuid_cacert uuid_id uuid_top
+  uuid_pkcs12=$(new_uuid);  uuid_vpnconfig=$(new_uuid)
+  uuid_cacert=$(new_uuid);  uuid_id=$(new_uuid);  uuid_top=$(new_uuid)
+
+  cat > "${mc_file}" <<MOBILECONFIG
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>IKEv2</key>
+			<dict>
+				<key>AuthenticationMethod</key>
+				<string>Certificate</string>
+				<key>ChildSecurityAssociationParameters</key>
+				<dict>
+					<key>DiffieHellmanGroup</key>
+					<integer>20</integer>
+					<key>EncryptionAlgorithm</key>
+					<string>AES-256</string>
+					<key>IntegrityAlgorithm</key>
+					<string>SHA2-256</string>
+					<key>LifeTimeInMinutes</key>
+					<integer>1440</integer>
+				</dict>
+				<key>DeadPeerDetectionRate</key>
+				<string>Low</string>
+				<key>DisableMOBIKE</key>
+				<integer>0</integer>
+				<key>DisableRedirect</key>
+				<integer>0</integer>
+				<key>EnableCertificateRevocationCheck</key>
+				<integer>0</integer>
+				<key>EnablePFS</key>
+				<true/>
+				<key>IKESecurityAssociationParameters</key>
+				<dict>
+					<key>DiffieHellmanGroup</key>
+					<integer>20</integer>
+					<key>EncryptionAlgorithm</key>
+					<string>AES-256</string>
+					<key>IntegrityAlgorithm</key>
+					<string>SHA2-256</string>
+					<key>LifeTimeInMinutes</key>
+					<integer>1440</integer>
+				</dict>
+				<!-- 0 = cert-only auth. Without this, iOS prompts for EAP creds -->
+				<key>ExtendedAuthEnabled</key>
+				<integer>0</integer>
+				<key>LocalIdentifier</key>
+				<string>${name}@${VPN_NAME}</string>
+				<key>PayloadCertificateUUID</key>
+				<string>${uuid_pkcs12}</string>
+				<key>RemoteAddress</key>
+				<string>${VPN_NAME}</string>
+				<key>RemoteIdentifier</key>
+				<string>${VPN_NAME}</string>
+				<!-- ServerCertificateCommonName & ServerCertificateIssuerCommonName both required. iOS seems to disconnect immediately if either is missing -->
+				<key>ServerCertificateCommonName</key>
+				<string>${VPN_NAME}</string>
+				<key>ServerCertificateIssuerCommonName</key>
+				<string>${VPN_NAME} CA</string>
+				<key>UseConfigurationAttributeInternalIPSubnet</key>
+				<integer>0</integer>
+			</dict>
+			<key>IPv4</key>
+			<dict>
+				<!-- 0 = iOS routes based on server-negotiated traffic selectors (local_ts). 1 would force full tunnel client-side -->
+				<key>OverridePrimary</key>
+				<integer>0</integer>
+			</dict>
+			<key>PayloadDescription</key>
+			<string>Configures VPN settings</string>
+			<key>PayloadDisplayName</key>
+			<string>VPN</string>
+			<key>PayloadIdentifier</key>
+			<string>com.apple.vpn.managed.${uuid_vpnconfig}</string>
+			<key>PayloadType</key>
+			<string>com.apple.vpn.managed</string>
+			<key>PayloadUUID</key>
+			<string>${uuid_vpnconfig}</string>
+			<key>PayloadVersion</key>
+			<real>1</real>
+			<key>Proxies</key>
+			<dict>
+				<key>HTTPEnable</key>
+				<integer>0</integer>
+				<key>HTTPSEnable</key>
+				<integer>0</integer>
+			</dict>
+			<key>UserDefinedName</key>
+			<string>${VPN_NAME}</string>
+			<key>VPNType</key>
+			<string>IKEv2</string>
+		</dict>
+		<dict>
+			<key>PayloadCertificateFileName</key>
+			<string>${VPN_NAME}_ca.der</string>
+			<key>PayloadContent</key>
+			<data>
+			%%CERT_CA_DER%%
+			</data>
+			<key>PayloadDescription</key>
+			<string>Adds a CA root certificate</string>
+			<key>PayloadDisplayName</key>
+			<string>${VPN_NAME} CA</string>
+			<key>PayloadIdentifier</key>
+			<string>com.apple.security.root.${uuid_cacert}</string>
+			<key>PayloadType</key>
+			<string>com.apple.security.root</string>
+			<key>PayloadUUID</key>
+			<string>${uuid_cacert}</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			%%PASSWORD%%
+			<key>PayloadCertificateFileName</key>
+			<string>${name}.p12</string>
+			<key>PayloadContent</key>
+			<data>
+			%%CERT_PKCS12%%
+			</data>
+			<key>PayloadDescription</key>
+			<string>Adds a PKCS#12-formatted certificate</string>
+			<key>PayloadDisplayName</key>
+			<string>${name}.p12</string>
+			<key>PayloadIdentifier</key>
+			<string>com.apple.security.pkcs12.${uuid_pkcs12}</string>
+			<key>PayloadType</key>
+			<string>com.apple.security.pkcs12</string>
+			<key>PayloadUUID</key>
+			<string>${uuid_pkcs12}</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+		</dict>
+	</array>
+	<key>PayloadDescription</key>
+	<string>Mobile device VPN package</string>
+	<key>PayloadDisplayName</key>
+	<string>${VPN_NAME}</string>
+	<key>PayloadIdentifier</key>
+	<string>${uuid_id}</string>
+	<key>PayloadOrganization</key>
+	<string>${VPN_NAME}</string>
+	<key>PayloadRemovalDisallowed</key>
+	<false/>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>${uuid_top}</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>
+MOBILECONFIG
+
+  # %%CERT_CA_DER%%, %%CERT_PKCS12%%, %%PASSWORD%% are substituted below via awk/sed (can't inline because of base64 output)
+
+  # embed or remove the password block
+  local tmp; tmp=$(mktemp)
+  if [[ "${embed}" == "yes" ]]; then
+    sed "s|%%PASSWORD%%|<key>Password</key><string>${client_pass}</string>|" \
+      "${mc_file}" > "$tmp" && mv "$tmp" "${mc_file}"
+  else
+    sed "/%%PASSWORD%%/d" "${mc_file}" > "$tmp" && mv "$tmp" "${mc_file}"
+  fi
+
+  # embed CA cert DER (base64)
+  tmp=$(mktemp)
+  awk "/%%CERT_CA_DER%%/ { system(\"base64 ${SWANCTL_DIR}/x509ca/caCert.der\") } \
+       !/%%CERT_CA_DER%%/ { print }" \
+    "${mc_file}" > "$tmp" && mv "$tmp" "${mc_file}"
+
+  # embed PKCS12 (base64)
+  tmp=$(mktemp)
+  awk "/%%CERT_PKCS12%%/ { system(\"base64 ${dist_dir}/${name}.p12\") } \
+       !/%%CERT_PKCS12%%/ { print }" \
+    "${mc_file}" > "$tmp" && mv "$tmp" "${mc_file}"
+
+  chmod 600 "${mc_file}"
+}
+
+cmd_add() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: roadwarrior-client add <name> [--password <pass>] [--embed-password]" >&2; exit 1
+  fi
+  shift
+
+  local embed="no"
+  local custom_pass=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --embed-password) embed="yes" ;;
+      --password) custom_pass="${2:-}"; shift ;;
+      *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
+    esac
+    shift
+  done
+
+  if [[ -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]]; then
+    echo "ERROR: client '${name}' already exists - use 'regen' to rebuild the mobileconfig" >&2; exit 1
+  fi
+
+  local dist_dir="${SWANCTL_DIR}/dist/${name}"
+  mkdir -p "${dist_dir}"
+  chmod 700 "${dist_dir}"
+
+  # pw priority: --password flag > server default > random
+  local client_pass
+  if [[ -n "${custom_pass}" ]]; then
+    client_pass="${custom_pass}"
+  elif [[ -n "${CERT_PASSWORD:-}" ]]; then
+    client_pass="${CERT_PASSWORD}"
+  else
+    client_pass=$(openssl rand -base64 16 | tr -d '/+=')
+  fi
+  echo "creating client: ${name}@${VPN_NAME}"
+
+  # client key
+  "$PKI" --gen --type rsa --size 2048 --outform pem \
+    > "${SWANCTL_DIR}/private/client_${name}Key.pem"
+  chmod 600 "${SWANCTL_DIR}/private/client_${name}Key.pem"
+
+  # client cert - SAN must match LocalIdentifier in mobileconfig
+  "$PKI" --pub --in "${SWANCTL_DIR}/private/client_${name}Key.pem" --type rsa \
+    | "$PKI" --issue \
+        --cacert  "${SWANCTL_DIR}/x509ca/caCert.pem" \
+        --cakey   "${SWANCTL_DIR}/private/caKey.pem" \
+        --dn      "C=NZ, O=roadwarrior, CN=${name}@${VPN_NAME}" \
+        --san     "${name}@${VPN_NAME}" \
+        --lifetime "${CERT_LIFESPAN}" \
+        --digest  sha256 \
+        --outform pem \
+    > "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+
+  # PKCS12 - -legacy required for Apple/OpenSSL 3.x compatibility (affects .p12 password encryption, not VPN encryption)
+  openssl pkcs12 -legacy -export \
+    -inkey    "${SWANCTL_DIR}/private/client_${name}Key.pem" \
+    -in       "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
+    -certfile "${SWANCTL_DIR}/x509ca/caCert.pem" \
+    -caname   "${VPN_NAME} CA" \
+    -name     "${name}" \
+    -password "pass:${client_pass}" \
+    -out      "${dist_dir}/${name}.p12"
+
+  cp "${SWANCTL_DIR}/x509/client_${name}Cert.pem" "${dist_dir}/${name}Cert.pem"
+  cp "${SWANCTL_DIR}/private/client_${name}Key.pem" "${dist_dir}/${name}Key.pem"
+  cp "${SWANCTL_DIR}/x509ca/caCert.pem" "${dist_dir}/CACert.pem"
+  cp "${SWANCTL_DIR}/x509ca/caCert.der" "${dist_dir}/CACert.der"
+
+  gen_mobileconfig "${name}" "${embed}" "${client_pass}"
+
+  swanctl --load-creds
+
+  echo ""
+  echo "client '${name}' created"
+  echo "mobileconfig : ${dist_dir}/${name}.mobileconfig"
+  echo "PKCS12       : ${dist_dir}/${name}.p12"
+  if [[ "${embed}" == "yes" ]]; then
+    echo "password     : embedded in mobileconfig"
+  else
+    echo "password     : ${client_pass}  (send separately)"
+  fi
+  echo "identity     : ${name}@${VPN_NAME}"
+}
+
+cmd_regen() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: roadwarrior-client regen <name> [--password <pass>] [--embed-password]" >&2; exit 1
+  fi
+  shift
+
+  local embed="no"
+  local custom_pass=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --embed-password) embed="yes" ;;
+      --password) custom_pass="${2:-}"; shift ;;
+      *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
+    esac
+    shift
+  done
+
+  if [[ ! -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]]; then
+    echo "ERROR: client '${name}' not found" >&2; exit 1
+  fi
+  if [[ ! -f "${SWANCTL_DIR}/dist/${name}/${name}.p12" ]]; then
+    echo "ERROR: ${name}.p12 missing - client data may be incomplete" >&2; exit 1
+  fi
+
+  local client_pass
+  if [[ -n "${custom_pass}" ]]; then
+    client_pass="${custom_pass}"
+  elif [[ -n "${CERT_PASSWORD:-}" ]]; then
+    client_pass="${CERT_PASSWORD}"
+  else
+    client_pass=$(openssl rand -base64 16 | tr -d '/+=')
+  fi
+
+  echo "regenerating mobileconfig for: ${name}"
+  gen_mobileconfig "${name}" "${embed}" "${client_pass}"
+  echo "done: ${SWANCTL_DIR}/dist/${name}/${name}.mobileconfig"
+}
+
+cmd_revoke() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: roadwarrior-client revoke <name>" >&2; exit 1
+  fi
+
+  if [[ ! -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]]; then
+    echo "ERROR: client '${name}' not found" >&2; exit 1
+  fi
+
+  read -r -p "remove all files for client '${name}'? [y/N] " confirm
+  if [[ "${confirm,,}" != "y" ]]; then
+    echo "aborted"; exit 0
+  fi
+
+  rm -f "${SWANCTL_DIR}/private/client_${name}Key.pem"
+  rm -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+  rm -rf "${SWANCTL_DIR}/dist/${name}"
+
+  # --clear kicks any active session for this client
+  swanctl --load-creds --clear
+  echo "client '${name}' removed"
+}
+
+cmd_list() {
+  echo "clients:"
+  local found=0
+  for cert in "${SWANCTL_DIR}"/x509/client_*Cert.pem; do
+    [[ -f "$cert" ]] || continue
+    local fname; fname=$(basename "$cert")
+    local name="${fname#client_}"; name="${name%Cert.pem}"
+    local expiry; expiry=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
+    printf "  %-20s  expires: %s\n" "${name}" "${expiry}"
+    found=1
+  done
+  [[ $found -eq 1 ]] || echo "(none)"
+}
+
+cmd_status() {
+  swanctl --list-sas
+}
+
+case "${1:-}" in
+  add)    shift; cmd_add    "$@" ;;
+  regen)  shift; cmd_regen  "$@" ;;
+  revoke) shift; cmd_revoke "$@" ;;
+  list)         cmd_list ;;
+  status)       cmd_status ;;
+  *)
+    echo "usage: roadwarrior-client <command> [args]"
+    echo ""
+    echo "add    <name> [--password <pass>] [--embed-password]"
+    echo "regen  <name> [--password <pass>] [--embed-password]"
+    echo "revoke <name>"
+    echo "list"
+    echo "status"
+    exit 1
+    ;;
+esac
