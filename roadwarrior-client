@@ -327,10 +327,12 @@ cmd_regen() {
     shift
   done
 
+  local dist_dir="${SWANCTL_DIR}/dist/${name}"
+
   if [[ ! -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]]; then
     echo "ERROR: client '${name}' not found" >&2; exit 1
   fi
-  if [[ ! -f "${SWANCTL_DIR}/dist/${name}/${name}.p12" ]]; then
+  if [[ ! -f "${dist_dir}/${name}.p12" ]]; then
     echo "ERROR: ${name}.p12 missing - client data may be incomplete" >&2; exit 1
   fi
 
@@ -341,6 +343,18 @@ cmd_regen() {
     client_pass="${CERT_PASSWORD}"
   else
     client_pass=$(openssl rand -base64 16 | tr -d '/+=')
+  fi
+
+  if [[ -n "${custom_pass}" ]]; then
+    # PKCS12 - -legacy required for Apple/OpenSSL 3.x compatibility (affects .p12 password encryption, not VPN encryption)
+    openssl pkcs12 -legacy -export \
+      -inkey    "${SWANCTL_DIR}/private/client_${name}Key.pem" \
+      -in       "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
+      -certfile "${SWANCTL_DIR}/x509ca/caCert.pem" \
+      -caname   "${VPN_NAME} CA" \
+      -name     "${name}" \
+      -password "pass:${client_pass}" \
+      -out      "${dist_dir}/${name}.p12"
   fi
 
   echo "regenerating mobileconfig for: ${name}"
