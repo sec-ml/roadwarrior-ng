@@ -23,12 +23,59 @@ new_uuid() {
   fi
 }
 
+# outputs OnDemandRules XML block for the mode/ssids/cellular settings
+gen_on_demand_block() {
+  local mode="$1"
+  local trusted_ssids="$2"
+  local cellular="$3"
+
+  [[ "${mode}" == "off" ]] && return
+  # \t's to match XML indents
+  printf '\t\t\t<key>OnDemandEnabled</key>\n'
+  printf '\t\t\t<integer>1</integer>\n'
+  printf '\t\t\t<key>OnDemandRules</key>\n'
+  printf '\t\t\t<array>\n'
+
+  if [[ -n "${trusted_ssids}" ]]; then
+    printf '\t\t\t\t<dict>\n'
+    printf '\t\t\t\t\t<key>Action</key>\n'
+    printf '\t\t\t\t\t<string>Disconnect</string>\n'
+    printf '\t\t\t\t\t<key>SSIDMatch</key>\n'
+    printf '\t\t\t\t\t<array>\n'
+    IFS=',' read -ra ssids <<< "${trusted_ssids}"
+    for ssid in "${ssids[@]}"; do
+      ssid="${ssid## }"; ssid="${ssid%% }"
+      printf '\t\t\t\t\t\t<string>%s</string>\n' "${ssid}"
+    done
+    printf '\t\t\t\t\t</array>\n'
+    printf '\t\t\t\t</dict>\n'
+  fi
+
+  if [[ "${cellular}" == "no" ]]; then
+    printf '\t\t\t\t<dict>\n'
+    printf '\t\t\t\t\t<key>Action</key>\n'
+    printf '\t\t\t\t\t<string>Disconnect</string>\n'
+    printf '\t\t\t\t\t<key>InterfaceTypeMatch</key>\n'
+    printf '\t\t\t\t\t<string>Cellular</string>\n'
+    printf '\t\t\t\t</dict>\n'
+  fi
+
+  printf '\t\t\t\t<dict>\n'
+  printf '\t\t\t\t\t<key>Action</key>\n'
+  printf '\t\t\t\t\t<string>Connect</string>\n'
+  printf '\t\t\t\t</dict>\n'
+  printf '\t\t\t</array>'
+}
+
 # generate mobileconfig for an existing client
-# gen_mobileconfig <name> [embed-password]
+# gen_mobileconfig <name> <embed> <client_pass> <on_demand_mode> <trusted_ssids> <cellular>
 gen_mobileconfig() {
   local name="$1"
   local embed="${2:-no}"
   local client_pass="${3:-}"
+  local on_demand_mode="${4:-${ON_DEMAND_MODE:-off}}"
+  local trusted_ssids="${5:-${ON_DEMAND_TRUSTED_SSIDS:-}}"
+  local cellular="${6:-${ON_DEMAND_CELLULAR:-yes}}"
   local dist_dir="${SWANCTL_DIR}/dist/${name}"
   local mc_file="${dist_dir}/${name}.mobileconfig"
 
@@ -112,6 +159,7 @@ gen_mobileconfig() {
 				<key>OverridePrimary</key>
 				<integer>0</integer>
 			</dict>
+			%%ON_DEMAND%%
 			<key>PayloadDescription</key>
 			<string>Configures VPN settings</string>
 			<key>PayloadDisplayName</key>
@@ -199,6 +247,20 @@ gen_mobileconfig() {
 MOBILECONFIG
 
   # %%CERT_CA_DER%%, %%CERT_PKCS12%%, %%PASSWORD%% are substituted below via awk/sed (can't inline because of base64 output)
+  # %%ON_DEMAND%% substituted because...multiline indented block reasons.
+
+  # embed or remove OnDemand block
+  local tmp; tmp=$(mktemp)
+  local on_demand_block; on_demand_block=$(gen_on_demand_block "${on_demand_mode}" "${trusted_ssids}" "${cellular}")
+  if [[ -n "${on_demand_block}" ]]; then
+    local tmp_od; tmp_od=$(mktemp)
+    printf '%s\n' "${on_demand_block}" > "${tmp_od}"
+    awk "/%%ON_DEMAND%%/ { while ((getline line < \"${tmp_od}\") > 0) print line; next } { print }" \
+      "${mc_file}" > "$tmp" && mv "$tmp" "${mc_file}"
+    rm -f "${tmp_od}"
+  else
+    sed "/%%ON_DEMAND%%/d" "${mc_file}" > "$tmp" && mv "$tmp" "${mc_file}"
+  fi
 
   # embed or remove the password block
   local tmp; tmp=$(mktemp)
@@ -227,16 +289,24 @@ MOBILECONFIG
 cmd_add() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client add <name> [--password <pass>] [--embed-password]" >&2; exit 1
+    echo "usage: roadwarrior-client add <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
   fi
   shift
 
   local embed="no"
   local custom_pass=""
+  local on_demand="${ON_DEMAND_MODE:-off}"
+  local trusted_ssids="${ON_DEMAND_TRUSTED_SSIDS:-}"
+  local cellular="${ON_DEMAND_CELLULAR:-yes}"
+  local routing="full"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --embed-password) embed="yes" ;;
       --password) custom_pass="${2:-}"; shift ;;
+      --on-demand) on_demand="${2:-}"; shift ;;
+      --trusted-ssids) trusted_ssids="${2:-}"; shift ;;
+      --cellular) cellular="${2:-}"; shift ;;
+      --routing) routing="${2:-}"; shift ;;
       *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
     esac
     shift
@@ -293,9 +363,10 @@ cmd_add() {
   cp "${SWANCTL_DIR}/x509ca/caCert.pem" "${dist_dir}/CACert.pem"
   cp "${SWANCTL_DIR}/x509ca/caCert.der" "${dist_dir}/CACert.der"
 
-  gen_mobileconfig "${name}" "${embed}" "${client_pass}"
+  gen_mobileconfig "${name}" "${embed}" "${client_pass}" "${on_demand}" "${trusted_ssids}" "${cellular}"
 
-  swanctl --load-creds
+  apply_routing "${name}" "${routing}"
+  swanctl --load-all
 
   echo ""
   echo "client '${name}' created"
@@ -312,25 +383,35 @@ cmd_add() {
 cmd_regen() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client regen <name> [--password <pass>] [--embed-password]" >&2; exit 1
+    echo "usage: roadwarrior-client regen <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
   fi
   shift
 
   local embed="no"
   local custom_pass=""
+  local on_demand="${ON_DEMAND_MODE:-off}"
+  local trusted_ssids="${ON_DEMAND_TRUSTED_SSIDS:-}"
+  local cellular="${ON_DEMAND_CELLULAR:-yes}"
+  local routing=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --embed-password) embed="yes" ;;
       --password) custom_pass="${2:-}"; shift ;;
+      --on-demand) on_demand="${2:-}"; shift ;;
+      --trusted-ssids) trusted_ssids="${2:-}"; shift ;;
+      --cellular) cellular="${2:-}"; shift ;;
+      --routing) routing="${2:-}"; shift ;;
       *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
     esac
     shift
   done
 
+  local dist_dir="${SWANCTL_DIR}/dist/${name}"
+
   if [[ ! -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]]; then
     echo "ERROR: client '${name}' not found" >&2; exit 1
   fi
-  if [[ ! -f "${SWANCTL_DIR}/dist/${name}/${name}.p12" ]]; then
+  if [[ ! -f "${dist_dir}/${name}.p12" ]]; then
     echo "ERROR: ${name}.p12 missing - client data may be incomplete" >&2; exit 1
   fi
 
@@ -343,8 +424,25 @@ cmd_regen() {
     client_pass=$(openssl rand -base64 16 | tr -d '/+=')
   fi
 
+  if [[ -n "${custom_pass}" ]]; then
+    # PKCS12 - -legacy required for Apple/OpenSSL 3.x compatibility (affects .p12 password encryption, not VPN encryption)
+    openssl pkcs12 -legacy -export \
+      -inkey    "${SWANCTL_DIR}/private/client_${name}Key.pem" \
+      -in       "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
+      -certfile "${SWANCTL_DIR}/x509ca/caCert.pem" \
+      -caname   "${VPN_NAME} CA" \
+      -name     "${name}" \
+      -password "pass:${client_pass}" \
+      -out      "${dist_dir}/${name}.p12"
+  fi
+
   echo "regenerating mobileconfig for: ${name}"
-  gen_mobileconfig "${name}" "${embed}" "${client_pass}"
+  gen_mobileconfig "${name}" "${embed}" "${client_pass}" "${on_demand}" "${trusted_ssids}" "${cellular}"
+
+  if [[ -n "${routing}" ]]; then
+    apply_routing "${name}" "${routing}"
+    swanctl --load-all --clear
+  fi
   echo "done: ${SWANCTL_DIR}/dist/${name}/${name}.mobileconfig"
 }
 
@@ -365,6 +463,7 @@ cmd_revoke() {
 
   rm -f "${SWANCTL_DIR}/private/client_${name}Key.pem"
   rm -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+  rm -f "${SWANCTL_DIR}/conf.d/routing-${name}.conf"
   rm -rf "${SWANCTL_DIR}/dist/${name}"
 
   # --clear kicks any active session for this client
@@ -390,18 +489,118 @@ cmd_status() {
   swanctl --list-sas
 }
 
+# write or remove per-client split tunnel conf
+# apply_routing <name> <full|split>
+apply_routing() {
+  local name="$1"
+  local mode="$2"
+  local routing_conf="${SWANCTL_DIR}/conf.d/routing-${name}.conf"
+
+  if [[ "${mode}" == "split" ]]; then
+    if [[ -z "${VPN_SPLIT_SUBNETS:-}" ]]; then
+      echo "ERROR: VPN_SPLIT_SUBNETS not set - run setup.sh with split subnets first" >&2; exit 1
+    fi
+    cat > "${routing_conf}" <<ROUTING
+connections {
+  rw-split-${name} {
+    version = 2
+    local_addrs = 0.0.0.0
+    proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
+    pools = rw_pool
+    local {
+      auth  = pubkey
+      certs = serverCert.pem
+      id    = ${VPN_NAME}
+    }
+    remote {
+      auth = pubkey
+      id   = "${name}@${VPN_NAME}"
+    }
+    children {
+      rw {
+        local_ts      = ${VPN_SPLIT_SUBNETS}
+        esp_proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
+        dpd_action    = clear
+        start_action  = trap
+        updown        = ${SWANCTL_DIR}/updown.sh
+      }
+    }
+  }
+}
+ROUTING
+  else
+    rm -f "${routing_conf}"
+  fi
+}
+
+cmd_set_routing() {
+  local name="${1:-}"
+  local mode="${2:-}"
+  if [[ -z "$name" || -z "$mode" ]]; then
+    echo "usage: roadwarrior-client set-routing <name> full|split" >&2; exit 1
+  fi
+  if [[ "${mode}" != "full" && "${mode}" != "split" ]]; then
+    echo "ERROR: mode must be full or split" >&2; exit 1
+  fi
+  if [[ ! -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]]; then
+    echo "ERROR: client '${name}' not found" >&2; exit 1
+  fi
+
+  apply_routing "${name}" "${mode}"
+  swanctl --load-all --clear
+  echo "${name}: routing set to ${mode}"
+}
+
+cmd_serve() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: roadwarrior-client serve <name> [--port <port>]" >&2; exit 1
+  fi
+  shift
+
+  local port=8000
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="${2:-}"; shift ;;
+      *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
+    esac
+    shift
+  done
+
+  local dist_dir="${SWANCTL_DIR}/dist/${name}"
+  if [[ ! -d "${dist_dir}" ]]; then
+    echo "ERROR: client '${name}' not found" >&2; exit 1
+  fi
+
+  echo "serving ${dist_dir} on port ${port} for 60 seconds"
+  echo "url: http://$(hostname -f):${port}/"
+  echo "press ctrl-c to stop early"
+  echo ""
+
+  # start python http server in bg, kill after 60s
+  python3 -m http.server "${port}" --directory "${dist_dir}" &
+  local server_pid=$!
+  ( sleep 60; kill "${server_pid}" 2>/dev/null ) &
+  wait "${server_pid}" 2>/dev/null || true
+  echo "server stopped"
+}
+
 case "${1:-}" in
   add)    shift; cmd_add    "$@" ;;
   regen)  shift; cmd_regen  "$@" ;;
   revoke) shift; cmd_revoke "$@" ;;
+  serve)  shift; cmd_serve  "$@" ;;
+  set-routing) shift; cmd_set_routing "$@" ;;
   list)         cmd_list ;;
   status)       cmd_status ;;
   *)
     echo "usage: roadwarrior-client <command> [args]"
     echo ""
-    echo "add    <name> [--password <pass>] [--embed-password]"
-    echo "regen  <name> [--password <pass>] [--embed-password]"
+    echo "add    <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]"
+    echo "regen  <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]"
     echo "revoke <name>"
+    echo "serve  <name> [--port <port>]"
+    echo "set-routing <name> full|split"
     echo "list"
     echo "status"
     exit 1
