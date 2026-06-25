@@ -203,4 +203,5 @@ swanctl --load-all
 
 echo ""
 echo "Done. VPN_NAME=${VPN_NAME}, pool=${VPN_RANGE}"
+echo "Note: TPM plugin warnings in the strongSwan log are expected if no TPM chip is present"
 echo "Add clients with: roadwarrior-client add <name>"
