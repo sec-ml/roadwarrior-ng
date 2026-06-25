@@ -108,7 +108,7 @@ cat > "${SWANCTL_DIR}/swanctl.conf" <<SWANCTL
 connections {
   rw {
     version = 2
-    local_addrs = ${VPN_NAME}
+    local_addrs = 0.0.0.0
     proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
     pools = rw_pool
     local {
@@ -145,7 +145,7 @@ if [[ -n "${VPN_SPLIT_SUBNETS:-}" ]]; then
 connections {
   rw-split {
     version = 2
-    local_addrs = ${VPN_NAME}
+    local_addrs = 0.0.0.0
     proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
     pools = rw_pool
     local {
