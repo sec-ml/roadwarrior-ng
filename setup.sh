@@ -24,6 +24,20 @@ if [[ -z "${DNS_SERVERS:-}" ]]; then
   DNS_SERVERS="${DNS_SERVERS:-1.1.1.1,8.8.8.8}"
 fi
 
+if [[ -z "${ON_DEMAND_MODE:-}" ]]; then
+  read -r -p "Default OnDemand mode for mobileconfigs (off/always/untrusted) [off]: " ON_DEMAND_MODE
+  ON_DEMAND_MODE="${ON_DEMAND_MODE:-off}"
+fi
+
+if [[ "${ON_DEMAND_MODE}" == "untrusted" && -z "${ON_DEMAND_TRUSTED_SSIDS:-}" ]]; then
+  read -r -p "Trusted SSIDs - VPN will not connect on these networks (blank to skip): " ON_DEMAND_TRUSTED_SSIDS
+fi
+
+if [[ -z "${ON_DEMAND_CELLULAR:-}" ]]; then
+  read -r -p "Connect on cellular networks? [yes]: " ON_DEMAND_CELLULAR
+  ON_DEMAND_CELLULAR="${ON_DEMAND_CELLULAR:-yes}"
+fi
+
 # -s to hide password input
 if [[ -z "${CERT_PASSWORD:-}" ]]; then
   read -r -s -p "Fallback PKCS12 password for client bundles: " CERT_PASSWORD
@@ -179,6 +193,9 @@ DNS_SERVERS="${DNS_SERVERS}"
 CERT_PASSWORD="${CERT_PASSWORD:-}"
 CERT_LIFESPAN=${CERT_LIFESPAN}
 PKI="${PKI}"
+ON_DEMAND_MODE="${ON_DEMAND_MODE:-off}"
+ON_DEMAND_TRUSTED_SSIDS="${ON_DEMAND_TRUSTED_SSIDS:-}"
+ON_DEMAND_CELLULAR="${ON_DEMAND_CELLULAR:-yes}"
 RWCONF
 chmod 600 "${SWANCTL_DIR}/roadwarrior.conf"
 

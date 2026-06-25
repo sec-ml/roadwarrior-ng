@@ -23,12 +23,59 @@ new_uuid() {
   fi
 }
 
+# outputs OnDemandRules XML block for the mode/ssids/cellular settings
+gen_on_demand_block() {
+  local mode="$1"
+  local trusted_ssids="$2"
+  local cellular="$3"
+
+  [[ "${mode}" == "off" ]] && return
+  # \t's to match XML indents
+  printf '\t\t\t<key>OnDemandEnabled</key>\n'
+  printf '\t\t\t<integer>1</integer>\n'
+  printf '\t\t\t<key>OnDemandRules</key>\n'
+  printf '\t\t\t<array>\n'
+
+  if [[ -n "${trusted_ssids}" ]]; then
+    printf '\t\t\t\t<dict>\n'
+    printf '\t\t\t\t\t<key>Action</key>\n'
+    printf '\t\t\t\t\t<string>Disconnect</string>\n'
+    printf '\t\t\t\t\t<key>SSIDMatch</key>\n'
+    printf '\t\t\t\t\t<array>\n'
+    IFS=',' read -ra ssids <<< "${trusted_ssids}"
+    for ssid in "${ssids[@]}"; do
+      ssid="${ssid## }"; ssid="${ssid%% }"
+      printf '\t\t\t\t\t\t<string>%s</string>\n' "${ssid}"
+    done
+    printf '\t\t\t\t\t</array>\n'
+    printf '\t\t\t\t</dict>\n'
+  fi
+
+  if [[ "${cellular}" == "no" ]]; then
+    printf '\t\t\t\t<dict>\n'
+    printf '\t\t\t\t\t<key>Action</key>\n'
+    printf '\t\t\t\t\t<string>Disconnect</string>\n'
+    printf '\t\t\t\t\t<key>InterfaceTypeMatch</key>\n'
+    printf '\t\t\t\t\t<string>Cellular</string>\n'
+    printf '\t\t\t\t</dict>\n'
+  fi
+
+  printf '\t\t\t\t<dict>\n'
+  printf '\t\t\t\t\t<key>Action</key>\n'
+  printf '\t\t\t\t\t<string>Connect</string>\n'
+  printf '\t\t\t\t</dict>\n'
+  printf '\t\t\t</array>'
+}
+
 # generate mobileconfig for an existing client
-# gen_mobileconfig <name> [embed-password]
+# gen_mobileconfig <name> <embed> <client_pass> <on_demand_mode> <trusted_ssids> <cellular>
 gen_mobileconfig() {
   local name="$1"
   local embed="${2:-no}"
   local client_pass="${3:-}"
+  local on_demand_mode="${4:-${ON_DEMAND_MODE:-off}}"
+  local trusted_ssids="${5:-${ON_DEMAND_TRUSTED_SSIDS:-}}"
+  local cellular="${6:-${ON_DEMAND_CELLULAR:-yes}}"
   local dist_dir="${SWANCTL_DIR}/dist/${name}"
   local mc_file="${dist_dir}/${name}.mobileconfig"
 
@@ -112,6 +159,7 @@ gen_mobileconfig() {
 				<key>OverridePrimary</key>
 				<integer>0</integer>
 			</dict>
+			%%ON_DEMAND%%
 			<key>PayloadDescription</key>
 			<string>Configures VPN settings</string>
 			<key>PayloadDisplayName</key>
@@ -199,6 +247,20 @@ gen_mobileconfig() {
 MOBILECONFIG
 
   # %%CERT_CA_DER%%, %%CERT_PKCS12%%, %%PASSWORD%% are substituted below via awk/sed (can't inline because of base64 output)
+  # %%ON_DEMAND%% substituted because...multiline indented block reasons.
+
+  # embed or remove OnDemand block
+  local tmp; tmp=$(mktemp)
+  local on_demand_block; on_demand_block=$(gen_on_demand_block "${on_demand_mode}" "${trusted_ssids}" "${cellular}")
+  if [[ -n "${on_demand_block}" ]]; then
+    local tmp_od; tmp_od=$(mktemp)
+    printf '%s\n' "${on_demand_block}" > "${tmp_od}"
+    awk "/%%ON_DEMAND%%/ { while ((getline line < \"${tmp_od}\") > 0) print line; next } { print }" \
+      "${mc_file}" > "$tmp" && mv "$tmp" "${mc_file}"
+    rm -f "${tmp_od}"
+  else
+    sed "/%%ON_DEMAND%%/d" "${mc_file}" > "$tmp" && mv "$tmp" "${mc_file}"
+  fi
 
   # embed or remove the password block
   local tmp; tmp=$(mktemp)
@@ -227,16 +289,22 @@ MOBILECONFIG
 cmd_add() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client add <name> [--password <pass>] [--embed-password]" >&2; exit 1
+    echo "usage: roadwarrior-client add <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no]" >&2; exit 1
   fi
   shift
 
   local embed="no"
   local custom_pass=""
+  local on_demand="${ON_DEMAND_MODE:-off}"
+  local trusted_ssids="${ON_DEMAND_TRUSTED_SSIDS:-}"
+  local cellular="${ON_DEMAND_CELLULAR:-yes}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --embed-password) embed="yes" ;;
       --password) custom_pass="${2:-}"; shift ;;
+      --on-demand) on_demand="${2:-}"; shift ;;
+      --trusted-ssids) trusted_ssids="${2:-}"; shift ;;
+      --cellular) cellular="${2:-}"; shift ;;
       *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
     esac
     shift
@@ -293,7 +361,7 @@ cmd_add() {
   cp "${SWANCTL_DIR}/x509ca/caCert.pem" "${dist_dir}/CACert.pem"
   cp "${SWANCTL_DIR}/x509ca/caCert.der" "${dist_dir}/CACert.der"
 
-  gen_mobileconfig "${name}" "${embed}" "${client_pass}"
+  gen_mobileconfig "${name}" "${embed}" "${client_pass}" "${on_demand}" "${trusted_ssids}" "${cellular}"
 
   swanctl --load-creds
 
@@ -312,16 +380,22 @@ cmd_add() {
 cmd_regen() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client regen <name> [--password <pass>] [--embed-password]" >&2; exit 1
+    echo "usage: roadwarrior-client regen <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no]" >&2; exit 1
   fi
   shift
 
   local embed="no"
   local custom_pass=""
+  local on_demand="${ON_DEMAND_MODE:-off}"
+  local trusted_ssids="${ON_DEMAND_TRUSTED_SSIDS:-}"
+  local cellular="${ON_DEMAND_CELLULAR:-yes}"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --embed-password) embed="yes" ;;
       --password) custom_pass="${2:-}"; shift ;;
+      --on-demand) on_demand="${2:-}"; shift ;;
+      --trusted-ssids) trusted_ssids="${2:-}"; shift ;;
+      --cellular) cellular="${2:-}"; shift ;;
       *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
     esac
     shift
@@ -358,7 +432,7 @@ cmd_regen() {
   fi
 
   echo "regenerating mobileconfig for: ${name}"
-  gen_mobileconfig "${name}" "${embed}" "${client_pass}"
+  gen_mobileconfig "${name}" "${embed}" "${client_pass}" "${on_demand}" "${trusted_ssids}" "${cellular}"
   echo "done: ${SWANCTL_DIR}/dist/${name}/${name}.mobileconfig"
 }
 
@@ -413,8 +487,8 @@ case "${1:-}" in
   *)
     echo "usage: roadwarrior-client <command> [args]"
     echo ""
-    echo "add    <name> [--password <pass>] [--embed-password]"
-    echo "regen  <name> [--password <pass>] [--embed-password]"
+    echo "add    <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no]"
+    echo "regen  <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no]"
     echo "revoke <name>"
     echo "list"
     echo "status"
