@@ -478,10 +478,45 @@ cmd_status() {
   swanctl --list-sas
 }
 
+cmd_serve() {
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    echo "usage: roadwarrior-client serve <name> [--port <port>]" >&2; exit 1
+  fi
+  shift
+
+  local port=8000
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port) port="${2:-}"; shift ;;
+      *) echo "ERROR: unknown option $1" >&2; exit 1 ;;
+    esac
+    shift
+  done
+
+  local dist_dir="${SWANCTL_DIR}/dist/${name}"
+  if [[ ! -d "${dist_dir}" ]]; then
+    echo "ERROR: client '${name}' not found" >&2; exit 1
+  fi
+
+  echo "serving ${dist_dir} on port ${port} for 60 seconds"
+  echo "url: http://$(hostname -f):${port}/"
+  echo "press ctrl-c to stop early"
+  echo ""
+
+  # start python http server in bg, kill after 60s
+  python3 -m http.server "${port}" --directory "${dist_dir}" &
+  local server_pid=$!
+  ( sleep 60; kill "${server_pid}" 2>/dev/null ) &
+  wait "${server_pid}" 2>/dev/null || true
+  echo "server stopped"
+}
+
 case "${1:-}" in
   add)    shift; cmd_add    "$@" ;;
   regen)  shift; cmd_regen  "$@" ;;
   revoke) shift; cmd_revoke "$@" ;;
+  serve)  shift; cmd_serve  "$@" ;;
   list)         cmd_list ;;
   status)       cmd_status ;;
   *)
@@ -490,6 +525,7 @@ case "${1:-}" in
     echo "add    <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no]"
     echo "regen  <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no]"
     echo "revoke <name>"
+    echo "serve  <name> [--port <port>]"
     echo "list"
     echo "status"
     exit 1
