@@ -516,6 +516,11 @@ cmd_status() {
   swanctl --list-sas
 }
 
+cmd_start()   { systemctl start strongswan;   echo "strongswan started"; }
+cmd_stop()    { systemctl stop strongswan;    echo "strongswan stopped"; }
+cmd_restart() { systemctl restart strongswan; echo "strongswan restarted"; }
+cmd_reboot()  { echo "rebooting..."; systemctl reboot; }
+
 # write or remove per-client split tunnel conf
 # apply_routing <name> <full|split>
 apply_routing() {
@@ -661,6 +666,10 @@ case "${1:-}" in
   set-routing) shift; cmd_set_routing "$@" ;;
   list)         cmd_list ;;
   status)       cmd_status ;;
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  restart)      cmd_restart ;;
+  reboot)       cmd_reboot ;;
   *)
     echo "usage: rwctl <command> [args]"
     echo ""
@@ -673,6 +682,8 @@ case "${1:-}" in
     echo "set-routing <name> full|split"
     echo "list"
     echo "status"
+    echo "start | stop | restart"
+    echo "reboot"
     exit 1
     ;;
 esac
