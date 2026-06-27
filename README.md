@@ -19,7 +19,6 @@ Inspired by `jethrocarr/puppet-roadwarrior`, and the same approach is generally 
 ## Future features & ideas
 
 - Proxmox container setup script
-- MQTT + Home Assistant discovery: per-client connected status, last IP, location, bytes; actions: disconnect/suspend/revoke; system commands: restart/reboot/update
 - Let's Encrypt server cert (Cloudflare DNS challenge). Removes need for CA cert in mobileconfig
 - Cloudflare DNS / DDNS support
 - Proper revocation (current `revoke` only deletes files)
@@ -48,6 +47,7 @@ Setup prompts:
 | Trusted SSIDs | (blank) | only shown if OnDemand mode is `untrusted` |
 | Connect on cellular | yes | |
 | Fallback PKCS12 password | (required) | used for client bundles if no per-client password is set |
+| Install MQTT daemon | no | Home Assistant MQTT compatibility |
 
 All values can be set as environment variables (to support future proxmox container script automation):
 
@@ -101,6 +101,15 @@ sudo rwctl regen <name>
 
 Rebuilds the mobileconfig from the existing certificate. Use this if changing OnDemand settings. Supports the same flags as `add`. If `--password` is set, the PKCS12 is also re-exported with new password.
 
+### Suspend / unsuspend a client
+
+```bash
+sudo rwctl suspend <name>
+sudo rwctl unsuspend <name>
+```
+
+Suspend blocks the client from connecting by moving their cert out of the trusted store. Active session is terminated immediately but other clients are unaffected.
+
 ### Revoke a client
 
 ```bash
@@ -112,15 +121,15 @@ Removes all files for the client and terminates any active session.
 ### List clients
 
 ```bash
-# lists client certs in /etc/swanctl/x509/
 sudo rwctl list
 ```
+
+Lists all clients with certificate expiry. Suspended clients are shown with `[suspended]`.
 
 ### Show active connections
 
 ```bash
 sudo rwctl status
-# Replicates: swanctl --list-sas 
 ```
 
 ---
@@ -150,6 +159,39 @@ sudo rwctl set-routing <name> full
 3. Download and open the `.mobileconfig` file
 4. Go to Settings > General > VPN & Device Management to install
 5. Enter the PKCS12 password when prompted (if not embedded)
+
+---
+
+## Home Assistant
+
+If the MQTT daemon was installed during setup, configure it with:
+
+```bash
+sudo rwctl mqtt config
+```
+
+Prompts for MQTT broker details, topic prefix, HA discovery prefix, and geoip2 license key (free account at maxmind.com). Downloads GeoLite2 City and ASN databases and restarts the daemon.
+
+Once running, HA auto-creates entities via MQTT discovery for each client:
+
+- connected, status, sessions, last IP, location, IP type, bytes in/out, session uptime
+- suspended switch: Toggle to block/unblock without revoking
+
+```bash
+sudo rwctl mqtt status
+sudo rwctl mqtt restart
+```
+
+---
+
+## Service management
+
+```bash
+sudo rwctl start
+sudo rwctl stop
+sudo rwctl restart
+sudo rwctl reboot
+```
 
 ---
 
