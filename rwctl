@@ -656,6 +656,82 @@ cmd_serve() {
   echo "server stopped"
 }
 
+# add or replace a key=value line in roadwarrior.conf
+set_conf_var() {
+  local key="$1" val="$2"
+  if grep -q "^${key}=" "${RW_CONF}"; then
+    sed -i "s|^${key}=.*|${key}=\"${val}\"|" "${RW_CONF}"
+  else
+    echo "${key}=\"${val}\"" >> "${RW_CONF}"
+  fi
+}
+
+cmd_mqtt_config() {
+  local host port user pass client_id prefix ha_prefix mm_key mm_db
+  host="${MQTT_HOST:-}"
+  port="${MQTT_PORT:-1883}"
+  user="${MQTT_USER:-}"
+  pass="${MQTT_PASS:-}"
+  client_id="${MQTT_CLIENT_ID:-roadwarrior}"
+  prefix="${MQTT_PREFIX:-roadwarrior}"
+  ha_prefix="${HA_PREFIX:-homeassistant}"
+  mm_key="${MAXMIND_LICENSE_KEY:-}"
+  mm_db="${MAXMIND_DB_PATH:-/var/lib/GeoIP}"
+
+  read -r -p "MQTT host [${host:-none}]: " input;          [[ -n "$input" ]] && host="$input"
+  read -r -p "MQTT port [${port}]: " input;                [[ -n "$input" ]] && port="$input"
+  read -r -p "MQTT user [${user:-none}]: " input;          [[ -n "$input" ]] && user="$input"
+  read -r -s -p "MQTT password (enter to keep): " input;   echo; [[ -n "$input" ]] && pass="$input"
+  read -r -p "MQTT client ID [${client_id}]: " input;      [[ -n "$input" ]] && client_id="$input"
+  read -r -p "Topic prefix [${prefix}]: " input;           [[ -n "$input" ]] && prefix="$input"
+  read -r -p "HA discovery prefix [${ha_prefix}]: " input; [[ -n "$input" ]] && ha_prefix="$input"
+  read -r -p "MaxMind license key [${mm_key:+set}]: " input; [[ -n "$input" ]] && mm_key="$input"
+  read -r -p "MaxMind DB path [${mm_db}]: " input;         [[ -n "$input" ]] && mm_db="$input"
+
+  [[ -n "$host" ]] || { echo "ERROR: MQTT host is required" >&2; exit 1; }
+
+  set_conf_var MQTT_HOST           "${host}"
+  set_conf_var MQTT_PORT           "${port}"
+  set_conf_var MQTT_USER           "${user}"
+  set_conf_var MQTT_PASS           "${pass}"
+  set_conf_var MQTT_CLIENT_ID      "${client_id}"
+  set_conf_var MQTT_PREFIX         "${prefix}"
+  set_conf_var HA_PREFIX           "${ha_prefix}"
+  set_conf_var MAXMIND_LICENSE_KEY "${mm_key}"
+  set_conf_var MAXMIND_DB_PATH     "${mm_db}"
+
+  if [[ -n "${mm_key}" ]]; then
+    echo "downloading MaxMind GeoLite2 databases..."
+    mkdir -p "${mm_db}"
+    for edition in GeoLite2-City GeoLite2-ASN; do
+      local url="https://download.maxmind.com/app/geoip_download?edition_id=${edition}&license_key=${mm_key}&suffix=tar.gz"
+      local tmp; tmp=$(mktemp /tmp/maxmind-XXXXXX.tar.gz)
+      curl -fsSL "${url}" -o "${tmp}"
+      tar -xzf "${tmp}" --strip-components=1 -C "${mm_db}" --wildcards '*.mmdb'
+      rm -f "${tmp}"
+      echo "  ${edition}.mmdb installed to ${mm_db}"
+    done
+  fi
+
+  if systemctl is-active roadwarrior-mqtt &>/dev/null; then
+    systemctl restart roadwarrior-mqtt
+    echo "mqtt daemon restarted"
+  fi
+  echo "done"
+}
+
+cmd_mqtt() {
+  local subcmd="${1:-}"
+  case "${subcmd}" in
+    config)  cmd_mqtt_config ;;
+    status)  systemctl status roadwarrior-mqtt --no-pager ;;
+    start)   systemctl start roadwarrior-mqtt;   echo "mqtt daemon started" ;;
+    stop)    systemctl stop roadwarrior-mqtt;    echo "mqtt daemon stopped" ;;
+    restart) systemctl restart roadwarrior-mqtt; echo "mqtt daemon restarted" ;;
+    *) echo "usage: rwctl mqtt config|status|start|stop|restart" >&2; exit 1 ;;
+  esac
+}
+
 case "${1:-}" in
   add)    shift; cmd_add    "$@" ;;
   regen)  shift; cmd_regen  "$@" ;;
@@ -670,6 +746,7 @@ case "${1:-}" in
   stop)         cmd_stop ;;
   restart)      cmd_restart ;;
   reboot)       cmd_reboot ;;
+  mqtt)   shift; cmd_mqtt "$@" ;;
   *)
     echo "usage: rwctl <command> [args]"
     echo ""
@@ -684,6 +761,7 @@ case "${1:-}" in
     echo "status"
     echo "start | stop | restart"
     echo "reboot"
+    echo "mqtt  config|status|start|stop|restart"
     exit 1
     ;;
 esac

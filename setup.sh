@@ -220,6 +220,41 @@ swanctl --load-all
 
 install -m 755 "$(dirname "$0")/rwctl" /usr/local/bin/rwctl
 
+# mqtt stuff
+if [[ -z "${INSTALL_MQTT:-}" ]]; then
+  read -r -p "Install MQTT daemon for Home Assistant integration? [y/N]: " INSTALL_MQTT
+fi
+
+if [[ "${INSTALL_MQTT,,}" == "y" || "${INSTALL_MQTT,,}" == "yes" ]]; then
+  install -m 755 "$(dirname "$0")/rwmqtt" /usr/local/bin/rwmqtt
+
+  python3 -m venv /opt/roadwarrior-mqtt
+  /opt/roadwarrior-mqtt/bin/pip install --quiet paho-mqtt vici geoip2
+
+  if ! id roadwarrior &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin roadwarrior
+  fi
+
+  # specifically allow rwctl subcommands rather than accepting all
+  cat > /etc/sudoers.d/roadwarrior <<'SUDOERS'
+roadwarrior ALL=(root) NOPASSWD: \
+  /usr/local/bin/rwctl suspend *, \
+  /usr/local/bin/rwctl unsuspend *, \
+  /usr/local/bin/rwctl start, \
+  /usr/local/bin/rwctl stop, \
+  /usr/local/bin/rwctl restart, \
+  /usr/local/bin/rwctl reboot, \
+  /usr/local/bin/rwctl status, \
+  /usr/local/bin/rwctl list
+SUDOERS
+  chmod 440 /etc/sudoers.d/roadwarrior
+
+  cp "$(dirname "$0")/roadwarrior-mqtt.service" /etc/systemd/system/
+  systemctl daemon-reload
+  systemctl enable roadwarrior-mqtt
+  echo "MQTT daemon installed. Run 'sudo rwctl mqtt config' to configure and start."
+fi
+
 echo ""
 echo "Done. VPN_NAME=${VPN_NAME}, pool=${VPN_RANGE}"
 echo "Note: TPM plugin warnings in the strongSwan log are expected if no TPM chip is present"

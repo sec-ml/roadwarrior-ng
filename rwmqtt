@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""roadwarrior MQTT bridge. HA MQTT discovery and client state/controls"""
+
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+from datetime import datetime, timezone
+
+import geoip2.database
+import geoip2.errors
+import paho.mqtt.client as mqtt
+import vici
+
+CONF_PATH    = "/etc/swanctl/roadwarrior.conf"
+VICI_SOCKET  = "/run/charon.vici"
+STATS_INTERVAL = 30
+
+
+def load_conf(path=CONF_PATH):
+    conf = {}
+    with open(path) as f:
+        for line in f:
+            m = re.match(r'^(\w+)="?(.*?)"?\s*$', line.strip())
+            if m:
+                conf[m.group(1)] = m.group(2)
+    return conf
+
+
+def sv(val):
+    """coerce vici bytes/str to str"""
+    return val.decode() if isinstance(val, bytes) else str(val)
+
+
+def list_clients(swanctl_dir):
+    """return {name: 'active'|'suspended'} from cert dirs"""
+    clients = {}
+    for dirname, status in [('x509', 'active'), ('x509suspended', 'suspended')]:
+        d = os.path.join(swanctl_dir, dirname)
+        if not os.path.isdir(d):
+            continue
+        for fname in os.listdir(d):
+            m = re.match(r'^client_(.+)Cert\.pem$', fname)
+            if m:
+                clients[m.group(1)] = status
+    return clients
+
+
+class RWMqtt:
+    def __init__(self, conf):
+        self.conf        = conf
+        self.vpn_name    = conf['VPN_NAME']
+        self.swanctl_dir = conf.get('SWANCTL_DIR', '/etc/swanctl')
+        self.prefix      = conf.get('MQTT_PREFIX', 'roadwarrior')
+        self.ha_prefix   = conf.get('HA_PREFIX', 'homeassistant')
+
+        db_path = conf.get('MAXMIND_DB_PATH', '/var/lib/GeoIP')
+        self.city_reader = geoip2.database.Reader(os.path.join(db_path, 'GeoLite2-City.mmdb'))
+        self.asn_reader  = geoip2.database.Reader(os.path.join(db_path, 'GeoLite2-ASN.mmdb'))
+
+        # {client_name: {ike_id: {ip, established (epoch), bytes_in, bytes_out}}}
+        self.active_sas = {}
+        self.lock = threading.Lock()
+
+        self.mqttc = mqtt.Client(client_id=conf.get('MQTT_CLIENT_ID', 'roadwarrior'))
+        user   = conf.get('MQTT_USER', '')
+        passwd = conf.get('MQTT_PASS', '')
+        if user:
+            self.mqttc.username_pw_set(user, passwd)
+        self.mqttc.will_set(f"{self.prefix}/availability", 'offline', retain=True)
+        self.mqttc.on_connect = self._on_connect
+        self.mqttc.on_message = self._on_message
+
+    def _geo(self, ip):
+        location = ''
+        ip_type  = ''
+        try:
+            r = self.city_reader.city(ip)
+            parts    = [r.city.name, r.country.name]
+            location = ', '.join(p for p in parts if p)
+        except Exception:
+            pass
+        try:
+            r   = self.asn_reader.asn(ip)
+            org = (r.autonomous_system_organization or '').lower()
+            ip_type = 'mobile' if any(t in org for t in
+                ('mobile', 'cellular', 'wireless', '4g', '5g', 'lte')) else 'broadband'
+        except Exception:
+            pass
+        return location, ip_type
+
+    def _id_to_name(self, remote_id):
+        m = re.match(rf'^(.+)@{re.escape(self.vpn_name)}$', remote_id)
+        return m.group(1) if m else None
+
+    def _pub(self, topic, payload, retain=False):
+        self.mqttc.publish(topic, payload, retain=retain)
+
+    def _pub_discovery(self, name):
+        device = {
+            'identifiers': [f"vpn_{name}"],
+            'name':        f"VPN {name}",
+            'manufacturer': 'roadwarrior',
+        }
+        base  = f"{self.prefix}/clients/{name}"
+        avail = f"{self.prefix}/availability"
+
+        sensors = [
+            ('connected',      'binary_sensor', 'connectivity', None),
+            ('status',         'sensor',        None,           None),
+            ('sessions',       'sensor',        None,           None),
+            ('last_seen',      'sensor',        'timestamp',    None),
+            ('last_ip',        'sensor',        None,           None),
+            ('location',       'sensor',        None,           None),
+            ('ip_type',        'sensor',        None,           None),
+            ('bytes_in',       'sensor',        'data_size',    'B'),
+            ('bytes_out',      'sensor',        'data_size',    'B'),
+            ('session_uptime', 'sensor',        'duration',     's'),
+        ]
+        for key, component, device_class, unit in sensors:
+            cfg = {
+                'unique_id':          f"vpn_{name}_{key}",
+                'name':               key.replace('_', ' ').title(),
+                'state_topic':        f"{base}/state",
+                'value_template':     f"{{{{ value_json.{key} }}}}",
+                'availability_topic': avail,
+                'device':             device,
+            }
+            if device_class:
+                cfg['device_class'] = device_class
+            if unit:
+                cfg['unit_of_measurement'] = unit
+            self._pub(f"{self.ha_prefix}/{component}/vpn_{name}_{key}/config",
+                      json.dumps(cfg), retain=True)
+
+        # suspended switch
+        self._pub(f"{self.ha_prefix}/switch/vpn_{name}_suspended/config", json.dumps({
+            'unique_id':          f"vpn_{name}_suspended",
+            'name':               'Suspended',
+            'state_topic':        f"{base}/suspended/state",
+            'command_topic':      f"{base}/suspended/set",
+            'availability_topic': avail,
+            'device':             device,
+        }), retain=True)
+
+    def _pub_state(self, name):
+        with self.lock:
+            sas = dict(self.active_sas.get(name, {}))
+
+        clients   = list_clients(self.swanctl_dir)
+        suspended = clients.get(name) == 'suspended'
+
+        if suspended:
+            status, connected = 'suspended', 'OFF'
+        elif sas:
+            status, connected = 'connected', 'ON'
+        else:
+            status, connected = 'disconnected', 'OFF'
+
+        bytes_in  = sum(sa.get('bytes_in',  0) for sa in sas.values())
+        bytes_out = sum(sa.get('bytes_out', 0) for sa in sas.values())
+
+        last_ip = ''
+        uptime  = 0
+        if sas:
+            newest  = max(sas.values(), key=lambda s: s.get('established', 0))
+            last_ip = newest.get('ip', '')
+            oldest  = min(sa.get('established', time.time()) for sa in sas.values())
+            uptime  = int(time.time() - oldest)
+
+        location, ip_type = self._geo(last_ip) if last_ip else ('', '')
+
+        base  = f"{self.prefix}/clients/{name}"
+        state = {
+            'connected':      connected,
+            'status':         status,
+            'sessions':       len(sas),
+            'last_seen':      datetime.now(timezone.utc).isoformat() if connected == 'ON' else '',
+            'last_ip':        last_ip,
+            'location':       location,
+            'ip_type':        ip_type,
+            'bytes_in':       bytes_in,
+            'bytes_out':      bytes_out,
+            'session_uptime': uptime,
+        }
+        self._pub(f"{base}/state",           json.dumps(state), retain=True)
+        self._pub(f"{base}/suspended/state", 'ON' if suspended else 'OFF', retain=True)
+
+    def _pub_system_state(self):
+        with self.lock:
+            connected = sum(1 for sas in self.active_sas.values() if sas)
+        clients = list_clients(self.swanctl_dir)
+        try:
+            r       = subprocess.run(['swanctl', '--version'], capture_output=True, text=True)
+            version = r.stdout.strip().splitlines()[0] if r.returncode == 0 else ''
+        except Exception:
+            version = ''
+        self._pub(f"{self.prefix}/system/state", json.dumps({
+            'connected_clients':  connected,
+            'total_clients':      len(clients),
+            'strongswan_version': version,
+        }), retain=True)
+
+    def _on_connect(self, client, userdata, flags, rc):
+        self._pub(f"{self.prefix}/availability", 'online', retain=True)
+        self.mqttc.subscribe(f"{self.prefix}/clients/+/suspended/set")
+        self.mqttc.subscribe(f"{self.prefix}/system/command")
+        for name in list_clients(self.swanctl_dir):
+            self._pub_discovery(name)
+            self._pub_state(name)
+        self._pub_system_state()
+
+    def _on_message(self, client, userdata, msg):
+        topic   = msg.topic
+        payload = msg.payload.decode().strip()
+        parts   = topic.split('/')
+        try:
+            # <prefix>/clients/<name>/suspended/set
+            if (len(parts) == 5 and parts[1] == 'clients' and
+                    parts[3] == 'suspended' and parts[4] == 'set'):
+                name = parts[2]
+                if payload == 'ON':
+                    self._rwctl('suspend', name)
+                elif payload == 'OFF':
+                    self._rwctl('unsuspend', name)
+                self._pub_state(name)
+            # <prefix>/system/command
+            elif len(parts) == 3 and parts[2] == 'command':
+                if payload in ('start', 'stop', 'restart', 'reboot'):
+                    self._rwctl(payload)
+        except Exception as e:
+            print(f"command error: {e}", flush=True)
+
+    def _rwctl(self, *args):
+        subprocess.run(['sudo', '/usr/local/bin/rwctl'] + list(args), check=True)
+
+    def _load_existing_sas(self):
+        """populate active_sas from currently established IKE SAs on startup"""
+        try:
+            session = vici.Session(sock_path=VICI_SOCKET)
+            for sa in session.list_sas():
+                for conn_name, ike_sa in sa.items():
+                    remote_id       = sv(ike_sa.get('remote-id',   ''))
+                    remote_ip       = sv(ike_sa.get('remote-host', ''))
+                    ike_id          = sv(ike_sa.get('uniqueid',    ''))
+                    established_ago = int(sv(ike_sa.get('established', '0')))
+                    name = self._id_to_name(remote_id)
+                    if not name:
+                        continue
+                    bytes_in = bytes_out = 0
+                    for child in ike_sa.get('child-sas', {}).values():
+                        bytes_in  += int(sv(child.get('bytes-in',  '0')))
+                        bytes_out += int(sv(child.get('bytes-out', '0')))
+                    with self.lock:
+                        if name not in self.active_sas:
+                            self.active_sas[name] = {}
+                        self.active_sas[name][ike_id] = {
+                            'ip':          remote_ip,
+                            'established': time.time() - established_ago,
+                            'bytes_in':    bytes_in,
+                            'bytes_out':   bytes_out,
+                        }
+        except Exception as e:
+            print(f"could not load existing SAs: {e}", flush=True)
+
+    def _stats_loop(self):
+        """update byte counters for active SAs every STATS_INTERVAL seconds"""
+        while True:
+            time.sleep(STATS_INTERVAL)
+            try:
+                session = vici.Session(sock_path=VICI_SOCKET)
+                updated = set()
+                for sa in session.list_sas():
+                    for conn_name, ike_sa in sa.items():
+                        remote_id = sv(ike_sa.get('remote-id', ''))
+                        ike_id    = sv(ike_sa.get('uniqueid',  ''))
+                        name = self._id_to_name(remote_id)
+                        if not name:
+                            continue
+                        bytes_in = bytes_out = 0
+                        for child in ike_sa.get('child-sas', {}).values():
+                            bytes_in  += int(sv(child.get('bytes-in',  '0')))
+                            bytes_out += int(sv(child.get('bytes-out', '0')))
+                        with self.lock:
+                            if name in self.active_sas and ike_id in self.active_sas[name]:
+                                self.active_sas[name][ike_id]['bytes_in']  = bytes_in
+                                self.active_sas[name][ike_id]['bytes_out'] = bytes_out
+                        updated.add(name)
+                for name in updated:
+                    self._pub_state(name)
+            except Exception as e:
+                print(f"stats poll error: {e}", flush=True)
+
+    def _vici_loop(self):
+        """listen for IKE SA up/down events; reconnect on failure"""
+        while True:
+            try:
+                session = vici.Session(sock_path=VICI_SOCKET)
+                for label, message in session.listen(['ike-updown']):
+                    ike       = message.get('ike', {})
+                    remote_id = sv(ike.get('remote-id',   ''))
+                    remote_ip = sv(ike.get('remote-host', ''))
+                    ike_id    = sv(ike.get('uniqueid',    ''))
+                    up        = sv(message.get('up', 'no')) == 'yes'
+                    name = self._id_to_name(remote_id)
+                    if not name:
+                        continue
+                    with self.lock:
+                        if up:
+                            if name not in self.active_sas:
+                                self.active_sas[name] = {}
+                            self.active_sas[name][ike_id] = {
+                                'ip':          remote_ip,
+                                'established': time.time(),
+                                'bytes_in':    0,
+                                'bytes_out':   0,
+                            }
+                        else:
+                            if name in self.active_sas:
+                                self.active_sas[name].pop(ike_id, None)
+                                if not self.active_sas[name]:
+                                    del self.active_sas[name]
+                    self._pub_state(name)
+                    self._pub_system_state()
+            except Exception as e:
+                print(f"vici error: {e}, reconnecting in 5s", flush=True)
+                time.sleep(5)
+
+    def run(self):
+        self._load_existing_sas()
+        self.mqttc.connect(
+            self.conf.get('MQTT_HOST', 'localhost'),
+            int(self.conf.get('MQTT_PORT', '1883')),
+        )
+        self.mqttc.loop_start()
+        threading.Thread(target=self._stats_loop, daemon=True).start()
+        self._vici_loop()  # blocks
+
+
+if __name__ == '__main__':
+    conf = load_conf()
+    RWMqtt(conf).run()
