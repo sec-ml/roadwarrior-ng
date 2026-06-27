@@ -4,6 +4,8 @@ set -euo pipefail
 SWANCTL_DIR="/etc/swanctl"
 RW_CONF="${SWANCTL_DIR}/roadwarrior.conf"
 
+[[ $EUID -eq 0 ]] || { echo "ERROR: must run as root (use sudo" >&2; exit 1; }
+
 # load config written by setup.sh
 if [[ ! -f "${RW_CONF}" ]]; then
   echo "ERROR: ${RW_CONF} not found - run setup.sh first" >&2; exit 1
@@ -20,6 +22,16 @@ new_uuid() {
     uuidgen | tr '[:upper:]' '[:lower:]'
   else
     cat /proc/sys/kernel/random/uuid
+  fi
+}
+
+# cert may be in x509 (active) or x509suspended (suspended)
+client_cert_path() {
+  local name="$1"
+  if [[ -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem" ]]; then
+    echo "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+  elif [[ -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem" ]]; then
+    echo "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
   fi
 }
 
@@ -289,7 +301,7 @@ MOBILECONFIG
 cmd_add() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client add <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
+    echo "usage: rwctl add <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
   fi
   shift
 
@@ -383,7 +395,7 @@ cmd_add() {
 cmd_regen() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client regen <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
+    echo "usage: rwctl regen <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
   fi
   shift
 
@@ -425,10 +437,11 @@ cmd_regen() {
   fi
 
   if [[ -n "${custom_pass}" ]]; then
+    local cert_path; cert_path=$(client_cert_path "${name}")
     # PKCS12 - -legacy required for Apple/OpenSSL 3.x compatibility (affects .p12 password encryption, not VPN encryption)
     openssl pkcs12 -legacy -export \
       -inkey    "${SWANCTL_DIR}/private/client_${name}Key.pem" \
-      -in       "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
+      -in       "${cert_path}" \
       -certfile "${SWANCTL_DIR}/x509ca/caCert.pem" \
       -caname   "${VPN_NAME} CA" \
       -name     "${name}" \
@@ -449,7 +462,7 @@ cmd_regen() {
 cmd_revoke() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client revoke <name>" >&2; exit 1
+    echo "usage: rwctl revoke <name>" >&2; exit 1
   fi
 
   if [[ ! -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]]; then
@@ -463,23 +476,37 @@ cmd_revoke() {
 
   rm -f "${SWANCTL_DIR}/private/client_${name}Key.pem"
   rm -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+  rm -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
   rm -f "${SWANCTL_DIR}/conf.d/routing-${name}.conf"
   rm -rf "${SWANCTL_DIR}/dist/${name}"
 
-  # --clear kicks any active session for this client
-  swanctl --load-creds --clear
+  # reload creds, but no --clear (to avoid affecting other clients). Find/kill active sessions for revoked client (if any)
+  swanctl --load-creds
+  local ike_id
+  ike_id=$(swanctl --list-sas 2>/dev/null | awk '
+    /^[[:space:]]*[a-zA-Z].*#[0-9]/ { gsub(/.*#/,""); gsub(/[^0-9].*/,""); current_id=$0 }
+    /remote.*'"${name}@${VPN_NAME}"'/ { print current_id; exit }
+  ')
+  if [[ -n "${ike_id}" ]]; then
+    swanctl --terminate --ike-id "${ike_id}" 2>/dev/null || true
+  fi
   echo "client '${name}' removed"
 }
 
 cmd_list() {
   echo "clients:"
   local found=0
-  for cert in "${SWANCTL_DIR}"/x509/client_*Cert.pem; do
+  for cert in "${SWANCTL_DIR}"/x509/client_*Cert.pem \
+              "${SWANCTL_DIR}"/x509suspended/client_*Cert.pem; do
     [[ -f "$cert" ]] || continue
     local fname; fname=$(basename "$cert")
     local name="${fname#client_}"; name="${name%Cert.pem}"
     local expiry; expiry=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
-    printf "  %-20s  expires: %s\n" "${name}" "${expiry}"
+    if [[ "$cert" == *x509suspended* ]]; then
+      printf "  %-20s  expires: %s  [suspended]\n" "${name}" "${expiry}"
+    else
+      printf "  %-20s  expires: %s\n" "${name}" "${expiry}"
+    fi
     found=1
   done
   [[ $found -eq 1 ]] || echo "(none)"
@@ -488,6 +515,11 @@ cmd_list() {
 cmd_status() {
   swanctl --list-sas
 }
+
+cmd_start()   { systemctl start strongswan;   echo "strongswan started"; }
+cmd_stop()    { systemctl stop strongswan;    echo "strongswan stopped"; }
+cmd_restart() { systemctl restart strongswan; echo "strongswan restarted"; }
+cmd_reboot()  { echo "rebooting..."; systemctl reboot; }
 
 # write or remove per-client split tunnel conf
 # apply_routing <name> <full|split>
@@ -533,11 +565,50 @@ ROUTING
   fi
 }
 
+cmd_suspend() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "usage: rwctl suspend <name>" >&2; exit 1; }
+  [[ -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]] \
+    || { echo "ERROR: client '${name}' not found" >&2; exit 1; }
+  [[ -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem" ]] \
+    || { echo "client '${name}' is already suspended"; exit 0; }
+
+  mkdir -p "${SWANCTL_DIR}/x509suspended"
+  mv "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
+     "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
+  # reload creds so charon no longer trusts this cert. Blocks new connections without affecting other clients
+  swanctl --load-creds
+  # terminate only this client's active SA if one exists
+  local ike_id
+  ike_id=$(swanctl --list-sas 2>/dev/null | awk '
+    /^[[:space:]]*[a-zA-Z].*#[0-9]/ { gsub(/.*#/,""); gsub(/[^0-9].*/,""); current_id=$0 }
+    /remote.*'"${name}@${VPN_NAME}"'/ { print current_id; exit }
+  ')
+  if [[ -n "${ike_id}" ]]; then
+    swanctl --terminate --ike-id "${ike_id}" 2>/dev/null || true
+  fi
+  echo "client '${name}' suspended"
+}
+
+cmd_unsuspend() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "usage: rwctl unsuspend <name>" >&2; exit 1; }
+  [[ -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]] \
+    || { echo "ERROR: client '${name}' not found" >&2; exit 1; }
+  [[ -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem" ]] \
+    || { echo "client '${name}' is not suspended"; exit 0; }
+
+  mv "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem" \
+     "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+  swanctl --load-creds
+  echo "client '${name}' unsuspended"
+}
+
 cmd_set_routing() {
   local name="${1:-}"
   local mode="${2:-}"
   if [[ -z "$name" || -z "$mode" ]]; then
-    echo "usage: roadwarrior-client set-routing <name> full|split" >&2; exit 1
+    echo "usage: rwctl set-routing <name> full|split" >&2; exit 1
   fi
   if [[ "${mode}" != "full" && "${mode}" != "split" ]]; then
     echo "ERROR: mode must be full or split" >&2; exit 1
@@ -554,7 +625,7 @@ cmd_set_routing() {
 cmd_serve() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client serve <name> [--port <port>]" >&2; exit 1
+    echo "usage: rwctl serve <name> [--port <port>]" >&2; exit 1
   fi
   shift
 
@@ -585,24 +656,112 @@ cmd_serve() {
   echo "server stopped"
 }
 
+# add or replace a key=value line in roadwarrior.conf
+set_conf_var() {
+  local key="$1" val="$2"
+  if grep -q "^${key}=" "${RW_CONF}"; then
+    sed -i "s|^${key}=.*|${key}=\"${val}\"|" "${RW_CONF}"
+  else
+    echo "${key}=\"${val}\"" >> "${RW_CONF}"
+  fi
+}
+
+cmd_mqtt_config() {
+  local host port user pass client_id prefix ha_prefix mm_key mm_db
+  host="${MQTT_HOST:-}"
+  port="${MQTT_PORT:-1883}"
+  user="${MQTT_USER:-}"
+  pass="${MQTT_PASS:-}"
+  client_id="${MQTT_CLIENT_ID:-roadwarrior}"
+  prefix="${MQTT_PREFIX:-roadwarrior}"
+  ha_prefix="${HA_PREFIX:-homeassistant}"
+  mm_key="${MAXMIND_LICENSE_KEY:-}"
+  mm_db="${MAXMIND_DB_PATH:-/var/lib/GeoIP}"
+
+  read -r -p "MQTT host [${host:-none}]: " input;          [[ -n "$input" ]] && host="$input"
+  read -r -p "MQTT port [${port}]: " input;                [[ -n "$input" ]] && port="$input"
+  read -r -p "MQTT user [${user:-none}]: " input;          [[ -n "$input" ]] && user="$input"
+  read -r -s -p "MQTT password (enter to keep): " input;   echo; [[ -n "$input" ]] && pass="$input"
+  read -r -p "MQTT client ID [${client_id}]: " input;      [[ -n "$input" ]] && client_id="$input"
+  read -r -p "Topic prefix [${prefix}]: " input;           [[ -n "$input" ]] && prefix="$input"
+  read -r -p "HA discovery prefix [${ha_prefix}]: " input; [[ -n "$input" ]] && ha_prefix="$input"
+  read -r -p "MaxMind license key [${mm_key:+set}]: " input; [[ -n "$input" ]] && mm_key="$input"
+  read -r -p "MaxMind DB path [${mm_db}]: " input;         [[ -n "$input" ]] && mm_db="$input"
+
+  [[ -n "$host" ]] || { echo "ERROR: MQTT host is required" >&2; exit 1; }
+
+  set_conf_var MQTT_HOST           "${host}"
+  set_conf_var MQTT_PORT           "${port}"
+  set_conf_var MQTT_USER           "${user}"
+  set_conf_var MQTT_PASS           "${pass}"
+  set_conf_var MQTT_CLIENT_ID      "${client_id}"
+  set_conf_var MQTT_PREFIX         "${prefix}"
+  set_conf_var HA_PREFIX           "${ha_prefix}"
+  set_conf_var MAXMIND_LICENSE_KEY "${mm_key}"
+  set_conf_var MAXMIND_DB_PATH     "${mm_db}"
+
+  if [[ -n "${mm_key}" ]]; then
+    echo "downloading MaxMind GeoLite2 databases..."
+    mkdir -p "${mm_db}"
+    for edition in GeoLite2-City GeoLite2-ASN; do
+      local url="https://download.maxmind.com/app/geoip_download?edition_id=${edition}&license_key=${mm_key}&suffix=tar.gz"
+      local tmp; tmp=$(mktemp /tmp/maxmind-XXXXXX.tar.gz)
+      curl -fsSL "${url}" -o "${tmp}"
+      tar -xzf "${tmp}" --strip-components=1 -C "${mm_db}" --wildcards '*.mmdb'
+      rm -f "${tmp}"
+      echo "  ${edition}.mmdb installed to ${mm_db}"
+    done
+  fi
+
+  if systemctl is-active roadwarrior-mqtt &>/dev/null; then
+    systemctl restart roadwarrior-mqtt
+    echo "mqtt daemon restarted"
+  fi
+  echo "done"
+}
+
+cmd_mqtt() {
+  local subcmd="${1:-}"
+  case "${subcmd}" in
+    config)  cmd_mqtt_config ;;
+    status)  systemctl status roadwarrior-mqtt --no-pager ;;
+    start)   systemctl start roadwarrior-mqtt;   echo "mqtt daemon started" ;;
+    stop)    systemctl stop roadwarrior-mqtt;    echo "mqtt daemon stopped" ;;
+    restart) systemctl restart roadwarrior-mqtt; echo "mqtt daemon restarted" ;;
+    *) echo "usage: rwctl mqtt config|status|start|stop|restart" >&2; exit 1 ;;
+  esac
+}
+
 case "${1:-}" in
   add)    shift; cmd_add    "$@" ;;
   regen)  shift; cmd_regen  "$@" ;;
   revoke) shift; cmd_revoke "$@" ;;
   serve)  shift; cmd_serve  "$@" ;;
+  suspend)     shift; cmd_suspend   "$@" ;;
+  unsuspend)   shift; cmd_unsuspend "$@" ;;
   set-routing) shift; cmd_set_routing "$@" ;;
   list)         cmd_list ;;
   status)       cmd_status ;;
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  restart)      cmd_restart ;;
+  reboot)       cmd_reboot ;;
+  mqtt)   shift; cmd_mqtt "$@" ;;
   *)
-    echo "usage: roadwarrior-client <command> [args]"
+    echo "usage: rwctl <command> [args]"
     echo ""
     echo "add    <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]"
     echo "regen  <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]"
     echo "revoke <name>"
     echo "serve  <name> [--port <port>]"
+    echo "suspend   <name>"
+    echo "unsuspend <name>"
     echo "set-routing <name> full|split"
     echo "list"
     echo "status"
+    echo "start | stop | restart"
+    echo "reboot"
+    echo "mqtt  config|status|start|stop|restart"
     exit 1
     ;;
 esac

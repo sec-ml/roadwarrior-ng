@@ -1,0 +1,16 @@
+[Unit]
+Description=roadwarrior MQTT bridge
+After=network.target strongswan.service
+Requires=strongswan.service
+
+[Service]
+Type=simple
+User=roadwarrior
+ExecStart=/opt/roadwarrior-mqtt/bin/python3 /usr/local/bin/rwmqtt
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

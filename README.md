@@ -19,7 +19,6 @@ Inspired by `jethrocarr/puppet-roadwarrior`, and the same approach is generally 
 ## Future features & ideas
 
 - Proxmox container setup script
-- MQTT + Home Assistant discovery: per-client connected status, last IP, location, bytes; actions: disconnect/suspend/revoke; system commands: restart/reboot/update
 - Let's Encrypt server cert (Cloudflare DNS challenge). Removes need for CA cert in mobileconfig
 - Cloudflare DNS / DDNS support
 - Proper revocation (current `revoke` only deletes files)
@@ -48,6 +47,7 @@ Setup prompts:
 | Trusted SSIDs | (blank) | only shown if OnDemand mode is `untrusted` |
 | Connect on cellular | yes | |
 | Fallback PKCS12 password | (required) | used for client bundles if no per-client password is set |
+| Install MQTT daemon | no | Home Assistant MQTT compatibility |
 
 All values can be set as environment variables (to support future proxmox container script automation):
 
@@ -55,7 +55,7 @@ All values can be set as environment variables (to support future proxmox contai
 sudo VPN_NAME=vpn.example.com VPN_RANGE=172.16.10.0/24 bash setup.sh
 ```
 
-Config saved to `/etc/swanctl/roadwarrior.conf`, used by `roadwarrior-client` for client generation/management.
+Config saved to `/etc/swanctl/roadwarrior.conf`, used by `rwctl` for client generation/management.
 
 ---
 
@@ -64,7 +64,7 @@ Config saved to `/etc/swanctl/roadwarrior.conf`, used by `roadwarrior-client` fo
 ### Add a client
 
 ```bash
-sudo ./roadwarrior-client add <name>
+sudo rwctl add <name>
 ```
 
 Generates a key, certificate, PKCS12 bundle, and mobileconfig. Files are written to `/etc/swanctl/dist/<name>/`.
@@ -83,28 +83,37 @@ Options:
 ### Serve profile
 
 ```bash
-sudo ./roadwarrior-client serve <name>
+sudo rwctl serve <name>
 ```
 
 Serves the client's dist directory over HTTP for 60 seconds. Browse to the printed URL from the target device to download the mobileconfig.
 
 ```bash
 # & to specify port:
-sudo ./roadwarrior-client serve <name> --port 9000
+sudo rwctl serve <name> --port 9000
 ```
 
 ### Regenerate mobileconfig
 
 ```bash
-sudo ./roadwarrior-client regen <name>
+sudo rwctl regen <name>
 ```
 
 Rebuilds the mobileconfig from the existing certificate. Use this if changing OnDemand settings. Supports the same flags as `add`. If `--password` is set, the PKCS12 is also re-exported with new password.
 
+### Suspend / unsuspend a client
+
+```bash
+sudo rwctl suspend <name>
+sudo rwctl unsuspend <name>
+```
+
+Suspend blocks the client from connecting by moving their cert out of the trusted store. Active session is terminated immediately but other clients are unaffected.
+
 ### Revoke a client
 
 ```bash
-sudo ./roadwarrior-client revoke <name>
+sudo rwctl revoke <name>
 ```
 
 Removes all files for the client and terminates any active session.
@@ -112,15 +121,15 @@ Removes all files for the client and terminates any active session.
 ### List clients
 
 ```bash
-# lists client certs in /etc/swanctl/x509/
-sudo ./roadwarrior-client list
+sudo rwctl list
 ```
+
+Lists all clients with certificate expiry. Suspended clients are shown with `[suspended]`.
 
 ### Show active connections
 
 ```bash
-sudo ./roadwarrior-client status
-# Replicates: swanctl --list-sas 
+sudo rwctl status
 ```
 
 ---
@@ -137,19 +146,52 @@ Routing is controlled server-side via the `local_ts` traffic selector. No mobile
 Split tunnel requires `VPN_SPLIT_SUBNETS` to be set during setup. Assign a client at creation time with `--routing split`, or change it later:
 
 ```bash
-sudo ./roadwarrior-client set-routing <name> split
-sudo ./roadwarrior-client set-routing <name> full
+sudo rwctl set-routing <name> split
+sudo rwctl set-routing <name> full
 ```
 
 ---
 
 ## iOS/macOS install
 
-1. Run `roadwarrior-client serve <name>`
+1. Run `rwctl serve <name>`
 2. Open the URL on the device (while connected to LAN...)
 3. Download and open the `.mobileconfig` file
 4. Go to Settings > General > VPN & Device Management to install
 5. Enter the PKCS12 password when prompted (if not embedded)
+
+---
+
+## Home Assistant
+
+If the MQTT daemon was installed during setup, configure it with:
+
+```bash
+sudo rwctl mqtt config
+```
+
+Prompts for MQTT broker details, topic prefix, HA discovery prefix, and geoip2 license key (free account at maxmind.com). Downloads GeoLite2 City and ASN databases and restarts the daemon.
+
+Once running, HA auto-creates entities via MQTT discovery for each client:
+
+- connected, status, sessions, last IP, location, IP type, bytes in/out, session uptime
+- suspended switch: Toggle to block/unblock without revoking
+
+```bash
+sudo rwctl mqtt status
+sudo rwctl mqtt restart
+```
+
+---
+
+## Service management
+
+```bash
+sudo rwctl start
+sudo rwctl stop
+sudo rwctl restart
+sudo rwctl reboot
+```
 
 ---
 
