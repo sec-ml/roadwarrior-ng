@@ -56,7 +56,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y \
 
 PKI=$(command -v pki 2>/dev/null || echo /usr/lib/ipsec/pki)
 
-mkdir -p "${SWANCTL_DIR}"/{x509,x509ca,private,dist,conf.d}
+mkdir -p "${SWANCTL_DIR}"/{x509,x509ca,x509suspended,private,dist,conf.d}
 chmod 700 "${SWANCTL_DIR}/private"
 
 # ca key/cert
