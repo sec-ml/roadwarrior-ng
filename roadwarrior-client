@@ -23,6 +23,16 @@ new_uuid() {
   fi
 }
 
+# cert may be in x509 (active) or x509suspended (suspended)
+client_cert_path() {
+  local name="$1"
+  if [[ -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem" ]]; then
+    echo "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+  elif [[ -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem" ]]; then
+    echo "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
+  fi
+}
+
 # outputs OnDemandRules XML block for the mode/ssids/cellular settings
 gen_on_demand_block() {
   local mode="$1"
@@ -425,10 +435,11 @@ cmd_regen() {
   fi
 
   if [[ -n "${custom_pass}" ]]; then
+    local cert_path; cert_path=$(client_cert_path "${name}")
     # PKCS12 - -legacy required for Apple/OpenSSL 3.x compatibility (affects .p12 password encryption, not VPN encryption)
     openssl pkcs12 -legacy -export \
       -inkey    "${SWANCTL_DIR}/private/client_${name}Key.pem" \
-      -in       "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
+      -in       "${cert_path}" \
       -certfile "${SWANCTL_DIR}/x509ca/caCert.pem" \
       -caname   "${VPN_NAME} CA" \
       -name     "${name}" \
@@ -463,23 +474,37 @@ cmd_revoke() {
 
   rm -f "${SWANCTL_DIR}/private/client_${name}Key.pem"
   rm -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+  rm -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
   rm -f "${SWANCTL_DIR}/conf.d/routing-${name}.conf"
   rm -rf "${SWANCTL_DIR}/dist/${name}"
 
-  # --clear kicks any active session for this client
-  swanctl --load-creds --clear
+  # reload creds, but no --clear (to avoid affecting other clients). Find/kill active sessions for revoked client (if any)
+  swanctl --load-creds
+  local ike_id
+  ike_id=$(swanctl --list-sas 2>/dev/null | awk '
+    /^[[:space:]]*[a-zA-Z].*#[0-9]/ { gsub(/.*#/,""); gsub(/[^0-9].*/,""); current_id=$0 }
+    /remote.*'"${name}@${VPN_NAME}"'/ { print current_id; exit }
+  ')
+  if [[ -n "${ike_id}" ]]; then
+    swanctl --terminate --ike-id "${ike_id}" 2>/dev/null || true
+  fi
   echo "client '${name}' removed"
 }
 
 cmd_list() {
   echo "clients:"
   local found=0
-  for cert in "${SWANCTL_DIR}"/x509/client_*Cert.pem; do
+  for cert in "${SWANCTL_DIR}"/x509/client_*Cert.pem \
+              "${SWANCTL_DIR}"/x509suspended/client_*Cert.pem; do
     [[ -f "$cert" ]] || continue
     local fname; fname=$(basename "$cert")
     local name="${fname#client_}"; name="${name%Cert.pem}"
     local expiry; expiry=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | cut -d= -f2)
-    printf "  %-20s  expires: %s\n" "${name}" "${expiry}"
+    if [[ "$cert" == *x509suspended* ]]; then
+      printf "  %-20s  expires: %s  [suspended]\n" "${name}" "${expiry}"
+    else
+      printf "  %-20s  expires: %s\n" "${name}" "${expiry}"
+    fi
     found=1
   done
   [[ $found -eq 1 ]] || echo "(none)"
@@ -531,6 +556,45 @@ ROUTING
   else
     rm -f "${routing_conf}"
   fi
+}
+
+cmd_suspend() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "usage: roadwarrior-client suspend <name>" >&2; exit 1; }
+  [[ -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]] \
+    || { echo "ERROR: client '${name}' not found" >&2; exit 1; }
+  [[ -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem" ]] \
+    || { echo "client '${name}' is already suspended"; exit 0; }
+
+  mkdir -p "${SWANCTL_DIR}/x509suspended"
+  mv "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
+     "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
+  # reload creds so charon no longer trusts this cert. Blocks new connections without affecting other clients
+  swanctl --load-creds
+  # terminate only this client's active SA if one exists
+  local ike_id
+  ike_id=$(swanctl --list-sas 2>/dev/null | awk '
+    /^[[:space:]]*[a-zA-Z].*#[0-9]/ { gsub(/.*#/,""); gsub(/[^0-9].*/,""); current_id=$0 }
+    /remote.*'"${name}@${VPN_NAME}"'/ { print current_id; exit }
+  ')
+  if [[ -n "${ike_id}" ]]; then
+    swanctl --terminate --ike-id "${ike_id}" 2>/dev/null || true
+  fi
+  echo "client '${name}' suspended"
+}
+
+cmd_unsuspend() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { echo "usage: roadwarrior-client unsuspend <name>" >&2; exit 1; }
+  [[ -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]] \
+    || { echo "ERROR: client '${name}' not found" >&2; exit 1; }
+  [[ -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem" ]] \
+    || { echo "client '${name}' is not suspended"; exit 0; }
+
+  mv "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem" \
+     "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
+  swanctl --load-creds
+  echo "client '${name}' unsuspended"
 }
 
 cmd_set_routing() {
@@ -590,6 +654,8 @@ case "${1:-}" in
   regen)  shift; cmd_regen  "$@" ;;
   revoke) shift; cmd_revoke "$@" ;;
   serve)  shift; cmd_serve  "$@" ;;
+  suspend)     shift; cmd_suspend   "$@" ;;
+  unsuspend)   shift; cmd_unsuspend "$@" ;;
   set-routing) shift; cmd_set_routing "$@" ;;
   list)         cmd_list ;;
   status)       cmd_status ;;
@@ -600,6 +666,8 @@ case "${1:-}" in
     echo "regen  <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]"
     echo "revoke <name>"
     echo "serve  <name> [--port <port>]"
+    echo "suspend   <name>"
+    echo "unsuspend <name>"
     echo "set-routing <name> full|split"
     echo "list"
     echo "status"
