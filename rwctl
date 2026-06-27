@@ -4,6 +4,8 @@ set -euo pipefail
 SWANCTL_DIR="/etc/swanctl"
 RW_CONF="${SWANCTL_DIR}/roadwarrior.conf"
 
+[[ $EUID -eq 0 ]] || { echo "ERROR: must run as root (use sudo" >&2; exit 1; }
+
 # load config written by setup.sh
 if [[ ! -f "${RW_CONF}" ]]; then
   echo "ERROR: ${RW_CONF} not found - run setup.sh first" >&2; exit 1
@@ -299,7 +301,7 @@ MOBILECONFIG
 cmd_add() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client add <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
+    echo "usage: rwctl add <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
   fi
   shift
 
@@ -393,7 +395,7 @@ cmd_add() {
 cmd_regen() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client regen <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
+    echo "usage: rwctl regen <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]" >&2; exit 1
   fi
   shift
 
@@ -460,7 +462,7 @@ cmd_regen() {
 cmd_revoke() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client revoke <name>" >&2; exit 1
+    echo "usage: rwctl revoke <name>" >&2; exit 1
   fi
 
   if [[ ! -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]]; then
@@ -560,7 +562,7 @@ ROUTING
 
 cmd_suspend() {
   local name="${1:-}"
-  [[ -n "$name" ]] || { echo "usage: roadwarrior-client suspend <name>" >&2; exit 1; }
+  [[ -n "$name" ]] || { echo "usage: rwctl suspend <name>" >&2; exit 1; }
   [[ -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]] \
     || { echo "ERROR: client '${name}' not found" >&2; exit 1; }
   [[ -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem" ]] \
@@ -585,7 +587,7 @@ cmd_suspend() {
 
 cmd_unsuspend() {
   local name="${1:-}"
-  [[ -n "$name" ]] || { echo "usage: roadwarrior-client unsuspend <name>" >&2; exit 1; }
+  [[ -n "$name" ]] || { echo "usage: rwctl unsuspend <name>" >&2; exit 1; }
   [[ -f "${SWANCTL_DIR}/private/client_${name}Key.pem" ]] \
     || { echo "ERROR: client '${name}' not found" >&2; exit 1; }
   [[ -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem" ]] \
@@ -601,7 +603,7 @@ cmd_set_routing() {
   local name="${1:-}"
   local mode="${2:-}"
   if [[ -z "$name" || -z "$mode" ]]; then
-    echo "usage: roadwarrior-client set-routing <name> full|split" >&2; exit 1
+    echo "usage: rwctl set-routing <name> full|split" >&2; exit 1
   fi
   if [[ "${mode}" != "full" && "${mode}" != "split" ]]; then
     echo "ERROR: mode must be full or split" >&2; exit 1
@@ -618,7 +620,7 @@ cmd_set_routing() {
 cmd_serve() {
   local name="${1:-}"
   if [[ -z "$name" ]]; then
-    echo "usage: roadwarrior-client serve <name> [--port <port>]" >&2; exit 1
+    echo "usage: rwctl serve <name> [--port <port>]" >&2; exit 1
   fi
   shift
 
@@ -660,7 +662,7 @@ case "${1:-}" in
   list)         cmd_list ;;
   status)       cmd_status ;;
   *)
-    echo "usage: roadwarrior-client <command> [args]"
+    echo "usage: rwctl <command> [args]"
     echo ""
     echo "add    <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]"
     echo "regen  <name> [--password <pass>] [--embed-password] [--on-demand off|always|untrusted] [--trusted-ssids <ssids>] [--cellular yes|no] [--routing full|split]"

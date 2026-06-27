@@ -55,7 +55,7 @@ All values can be set as environment variables (to support future proxmox contai
 sudo VPN_NAME=vpn.example.com VPN_RANGE=172.16.10.0/24 bash setup.sh
 ```
 
-Config saved to `/etc/swanctl/roadwarrior.conf`, used by `roadwarrior-client` for client generation/management.
+Config saved to `/etc/swanctl/roadwarrior.conf`, used by `rwctl` for client generation/management.
 
 ---
 
@@ -64,7 +64,7 @@ Config saved to `/etc/swanctl/roadwarrior.conf`, used by `roadwarrior-client` fo
 ### Add a client
 
 ```bash
-sudo ./roadwarrior-client add <name>
+sudo rwctl add <name>
 ```
 
 Generates a key, certificate, PKCS12 bundle, and mobileconfig. Files are written to `/etc/swanctl/dist/<name>/`.
@@ -83,20 +83,20 @@ Options:
 ### Serve profile
 
 ```bash
-sudo ./roadwarrior-client serve <name>
+sudo rwctl serve <name>
 ```
 
 Serves the client's dist directory over HTTP for 60 seconds. Browse to the printed URL from the target device to download the mobileconfig.
 
 ```bash
 # & to specify port:
-sudo ./roadwarrior-client serve <name> --port 9000
+sudo rwctl serve <name> --port 9000
 ```
 
 ### Regenerate mobileconfig
 
 ```bash
-sudo ./roadwarrior-client regen <name>
+sudo rwctl regen <name>
 ```
 
 Rebuilds the mobileconfig from the existing certificate. Use this if changing OnDemand settings. Supports the same flags as `add`. If `--password` is set, the PKCS12 is also re-exported with new password.
@@ -104,7 +104,7 @@ Rebuilds the mobileconfig from the existing certificate. Use this if changing On
 ### Revoke a client
 
 ```bash
-sudo ./roadwarrior-client revoke <name>
+sudo rwctl revoke <name>
 ```
 
 Removes all files for the client and terminates any active session.
@@ -113,13 +113,13 @@ Removes all files for the client and terminates any active session.
 
 ```bash
 # lists client certs in /etc/swanctl/x509/
-sudo ./roadwarrior-client list
+sudo rwctl list
 ```
 
 ### Show active connections
 
 ```bash
-sudo ./roadwarrior-client status
+sudo rwctl status
 # Replicates: swanctl --list-sas 
 ```
 
@@ -137,15 +137,15 @@ Routing is controlled server-side via the `local_ts` traffic selector. No mobile
 Split tunnel requires `VPN_SPLIT_SUBNETS` to be set during setup. Assign a client at creation time with `--routing split`, or change it later:
 
 ```bash
-sudo ./roadwarrior-client set-routing <name> split
-sudo ./roadwarrior-client set-routing <name> full
+sudo rwctl set-routing <name> split
+sudo rwctl set-routing <name> full
 ```
 
 ---
 
 ## iOS/macOS install
 
-1. Run `roadwarrior-client serve <name>`
+1. Run `rwctl serve <name>`
 2. Open the URL on the device (while connected to LAN...)
 3. Download and open the `.mobileconfig` file
 4. Go to Settings > General > VPN & Device Management to install

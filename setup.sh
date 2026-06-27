@@ -218,7 +218,9 @@ systemctl enable strongswan
 systemctl restart strongswan
 swanctl --load-all
 
+install -m 755 "$(dirname "$0")/rwctl" /usr/local/bin/rwctl
+
 echo ""
 echo "Done. VPN_NAME=${VPN_NAME}, pool=${VPN_RANGE}"
 echo "Note: TPM plugin warnings in the strongSwan log are expected if no TPM chip is present"
-echo "Add clients with: roadwarrior-client add <name>"
+echo "Add clients with: rwctl add <name>"
