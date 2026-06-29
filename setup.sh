@@ -171,34 +171,8 @@ esac
 UPDOWN
 chmod 755 "${SWANCTL_DIR}/updown.sh"
 
-# swanctl.conf
+# swanctl.conf. Now pools only. per-client connections handled by rwctl. (conf.d/client-<name>.conf)
 cat > "${SWANCTL_DIR}/swanctl.conf" <<SWANCTL
-connections {
-  rw {
-    version = 2
-    local_addrs = 0.0.0.0
-    proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
-    pools = rw_pool
-    local {
-      auth  = pubkey
-      certs = serverCert.pem
-      id    = ${VPN_NAME}
-    }
-    remote {
-      auth = pubkey
-    }
-    children {
-      rw {
-        local_ts      = 0.0.0.0/0
-        esp_proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
-        dpd_action    = clear
-        start_action  = trap
-        updown        = ${SWANCTL_DIR}/updown.sh
-      }
-    }
-  }
-}
-
 pools {
   rw_pool {
     addrs = ${VPN_RANGE}
@@ -206,37 +180,6 @@ pools {
   }
 }
 SWANCTL
-
-# split tunnel block. Only written if subnets were provided
-if [[ -n "${VPN_SPLIT_SUBNETS:-}" ]]; then
-  cat > "${SWANCTL_DIR}/conf.d/split.conf" <<SPLIT
-connections {
-  rw-split {
-    version = 2
-    local_addrs = 0.0.0.0
-    proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
-    pools = rw_pool
-    local {
-      auth  = pubkey
-      certs = serverCert.pem
-      id    = ${VPN_NAME}
-    }
-    remote {
-      auth = pubkey
-    }
-    children {
-      rw {
-        local_ts      = ${VPN_SPLIT_SUBNETS}
-        esp_proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
-        dpd_action    = clear
-        start_action  = trap
-        updown        = ${SWANCTL_DIR}/updown.sh
-      }
-    }
-  }
-}
-SPLIT
-fi
 
 # roadwarrior config
 cat > "${SWANCTL_DIR}/roadwarrior.conf" <<RWCONF
