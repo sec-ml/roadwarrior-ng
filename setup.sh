@@ -1,6 +1,60 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+install_mqtt() {
+  install -m 755 "$(dirname "$0")/rwmqtt" /usr/local/bin/rwmqtt
+
+  apt-get update -qq
+  # fix error where python3-venv not installed by default
+  DEBIAN_FRONTEND=noninteractive apt-get install -y python3-venv
+  python3 -m venv /opt/roadwarrior-mqtt
+  /opt/roadwarrior-mqtt/bin/pip install --quiet paho-mqtt vici geoip2
+
+  if ! id roadwarrior &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin roadwarrior
+  fi
+
+  # roadwarrior.conf perms 600 by default. roadwarrior user (for daemon) needs read access
+  chown root:roadwarrior /etc/swanctl/roadwarrior.conf
+  chmod 640 /etc/swanctl/roadwarrior.conf
+
+  # specifically allow rwctl subcommands rather than accepting all
+  cat > /etc/sudoers.d/roadwarrior <<'SUDOERS'
+roadwarrior ALL=(root) NOPASSWD: \
+  /usr/local/bin/rwctl suspend *, \
+  /usr/local/bin/rwctl unsuspend *, \
+  /usr/local/bin/rwctl start, \
+  /usr/local/bin/rwctl stop, \
+  /usr/local/bin/rwctl restart, \
+  /usr/local/bin/rwctl reboot, \
+  /usr/local/bin/rwctl status, \
+  /usr/local/bin/rwctl list
+SUDOERS
+  chmod 440 /etc/sudoers.d/roadwarrior
+
+  # allow roadwarrior user to read the VICI socket (and stop perm reset on restart)
+  mkdir -p /etc/systemd/system/strongswan.service.d
+  cat > /etc/systemd/system/strongswan.service.d/vici-perms.conf <<'DROPIN'
+[Service]
+ExecStartPost=/bin/sh -c 'i=0; while [ ! -S /run/charon.vici ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; chown root:roadwarrior /run/charon.vici && chmod 660 /run/charon.vici'
+DROPIN
+
+  cp "$(dirname "$0")/roadwarrior-mqtt.service" /etc/systemd/system/
+  systemctl daemon-reload
+  systemctl enable roadwarrior-mqtt
+  # apply socket permissions without needing strongswan restart
+  if [ -S /run/charon.vici ]; then
+    chown root:roadwarrior /run/charon.vici
+    chmod 660 /run/charon.vici
+  fi
+  echo "MQTT daemon installed. Run 'sudo rwctl mqtt config' to configure and start."
+}
+
+if [[ "${MQTT_ONLY:-}" == "yes" || "${MQTT_ONLY:-}" == "y" ]]; then
+  install_mqtt
+  exit 0
+fi
+
 DEFAULT_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
 SWANCTL_DIR="/etc/swanctl"
 CERT_LIFESPAN=3650
@@ -226,33 +280,8 @@ if [[ -z "${INSTALL_MQTT:-}" ]]; then
 fi
 
 if [[ "${INSTALL_MQTT,,}" == "y" || "${INSTALL_MQTT,,}" == "yes" ]]; then
-  install -m 755 "$(dirname "$0")/rwmqtt" /usr/local/bin/rwmqtt
-
-  python3 -m venv /opt/roadwarrior-mqtt
-  /opt/roadwarrior-mqtt/bin/pip install --quiet paho-mqtt vici geoip2
-
-  if ! id roadwarrior &>/dev/null; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin roadwarrior
-  fi
-
-  # specifically allow rwctl subcommands rather than accepting all
-  cat > /etc/sudoers.d/roadwarrior <<'SUDOERS'
-roadwarrior ALL=(root) NOPASSWD: \
-  /usr/local/bin/rwctl suspend *, \
-  /usr/local/bin/rwctl unsuspend *, \
-  /usr/local/bin/rwctl start, \
-  /usr/local/bin/rwctl stop, \
-  /usr/local/bin/rwctl restart, \
-  /usr/local/bin/rwctl reboot, \
-  /usr/local/bin/rwctl status, \
-  /usr/local/bin/rwctl list
-SUDOERS
-  chmod 440 /etc/sudoers.d/roadwarrior
-
-  cp "$(dirname "$0")/roadwarrior-mqtt.service" /etc/systemd/system/
-  systemctl daemon-reload
-  systemctl enable roadwarrior-mqtt
-  echo "MQTT daemon installed. Run 'sudo rwctl mqtt config' to configure and start."
+  # move to new function
+  install_mqtt
 fi
 
 echo ""
