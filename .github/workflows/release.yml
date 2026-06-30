@@ -1,0 +1,60 @@
+# Create a GitHub release when a version tag is pushed.
+# For manual runs: enter the version number and the workflow creates the tag.
+# Release notes are extracted from CHANGELOG.md (everything since the prev
+# release, or everyhing if there are no previous releases).
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"   # e.g. 1.0.4 (no v prefix)
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to release"
+        required: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create release and upload assets
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract changelog since last release
+        id: changelog
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the last published release tag, empty if none
+          prev_rel=$(gh release list --limit 1 --json tagName --jq '.[0].tagName // ""' 2>/dev/null || echo "")
+
+          if [ -z "$prev_rel" ]; then
+            # No previous release — include everything in the changelog
+            NOTES=$(awk "/^## /{found=1} found{print}" CHANGELOG.md)
+          else
+            # Include all sections from the top down until before the previous release
+            NOTES=$(awk "/^## /{found=1} found && /^## ${prev_rel}/{exit} found{print}" CHANGELOG.md)
+          fi
+
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create release and upload scripts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          body: ${{ steps.changelog.outputs.notes }}
+          files: |
+            setup.sh
+            rwctl
+            rwmqtt
+            roadwarrior-mqtt.service
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
