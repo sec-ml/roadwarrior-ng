@@ -477,19 +477,13 @@ cmd_revoke() {
   rm -f "${SWANCTL_DIR}/private/client_${name}Key.pem"
   rm -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
   rm -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
+  rm -f "${SWANCTL_DIR}/conf.d/client-${name}.conf"
+  rm -f "${SWANCTL_DIR}/conf.d/client-${name}.conf.suspended"
   rm -f "${SWANCTL_DIR}/conf.d/routing-${name}.conf"
   rm -rf "${SWANCTL_DIR}/dist/${name}"
 
-  # reload creds, but no --clear (to avoid affecting other clients). Find/kill active sessions for revoked client (if any)
-  swanctl --load-creds
-  local ike_id
-  ike_id=$(swanctl --list-sas 2>/dev/null | awk '
-    /^[[:space:]]*[a-zA-Z].*#[0-9]/ { gsub(/.*#/,""); gsub(/[^0-9].*/,""); current_id=$0 }
-    /remote.*'"${name}@${VPN_NAME}"'/ { print current_id; exit }
-  ')
-  if [[ -n "${ike_id}" ]]; then
-    swanctl --terminate --ike-id "${ike_id}" 2>/dev/null || true
-  fi
+  # reload conns & creds. --clear terminates now orphaned SAs. No other clients *should* be affected...
+  swanctl --load-all --clear
   echo "client '${name}' removed"
 }
 
@@ -521,28 +515,34 @@ cmd_stop()    { systemctl stop strongswan;    echo "strongswan stopped"; }
 cmd_restart() { systemctl restart strongswan; echo "strongswan restarted"; }
 cmd_reboot()  { echo "rebooting..."; systemctl reboot; }
 
-# write or remove per-client split tunnel conf
+# write per-client connection config
 # apply_routing <name> <full|split>
 apply_routing() {
   local name="$1"
   local mode="$2"
-  local routing_conf="${SWANCTL_DIR}/conf.d/routing-${name}.conf"
+  local conn_conf="${SWANCTL_DIR}/conf.d/client-${name}.conf"
+  local local_ts
 
   if [[ "${mode}" == "split" ]]; then
     if [[ -z "${VPN_SPLIT_SUBNETS:-}" ]]; then
       echo "ERROR: VPN_SPLIT_SUBNETS not set - run setup.sh with split subnets first" >&2; exit 1
     fi
-    cat > "${routing_conf}" <<ROUTING
+    local_ts="${VPN_SPLIT_SUBNETS}"
+  else
+    local_ts="0.0.0.0/0"
+  fi
+
+  cat > "${conn_conf}" <<CONN
 connections {
-  rw-split-${name} {
+  rw-${name} {
     version = 2
     local_addrs = 0.0.0.0
     proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
     pools = rw_pool
     local {
-      auth  = pubkey
+      auth = pubkey
       certs = serverCert.pem
-      id    = ${VPN_NAME}
+      id = ${VPN_NAME}
     }
     remote {
       auth = pubkey
@@ -550,19 +550,16 @@ connections {
     }
     children {
       rw {
-        local_ts      = ${VPN_SPLIT_SUBNETS}
+        local_ts = ${local_ts}
         esp_proposals = aes256-sha256-ecp384, aes256-sha256-modp2048, aes128-sha1-modp2048
-        dpd_action    = clear
-        start_action  = trap
-        updown        = ${SWANCTL_DIR}/updown.sh
+        dpd_action = clear
+        start_action = trap
+        updown = ${SWANCTL_DIR}/updown.sh
       }
     }
   }
 }
-ROUTING
-  else
-    rm -f "${routing_conf}"
-  fi
+CONN
 }
 
 cmd_suspend() {
@@ -576,17 +573,12 @@ cmd_suspend() {
   mkdir -p "${SWANCTL_DIR}/x509suspended"
   mv "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
      "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
-  # reload creds so charon no longer trusts this cert. Blocks new connections without affecting other clients
-  swanctl --load-creds
-  # terminate only this client's active SA if one exists
-  local ike_id
-  ike_id=$(swanctl --list-sas 2>/dev/null | awk '
-    /^[[:space:]]*[a-zA-Z].*#[0-9]/ { gsub(/.*#/,""); gsub(/[^0-9].*/,""); current_id=$0 }
-    /remote.*'"${name}@${VPN_NAME}"'/ { print current_id; exit }
-  ')
-  if [[ -n "${ike_id}" ]]; then
-    swanctl --terminate --ike-id "${ike_id}" 2>/dev/null || true
-  fi
+
+  local conn_conf="${SWANCTL_DIR}/conf.d/client-${name}.conf"
+  [[ -f "${conn_conf}" ]] && mv "${conn_conf}" "${conn_conf}.suspended"
+
+  # reload connections. --clear only kills associations for this client (if any exist)
+  swanctl --load-conns --clear
   echo "client '${name}' suspended"
 }
 
@@ -600,7 +592,11 @@ cmd_unsuspend() {
 
   mv "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem" \
      "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
-  swanctl --load-creds
+
+  local conn_conf="${SWANCTL_DIR}/conf.d/client-${name}.conf"
+  [[ -f "${conn_conf}.suspended" ]] && mv "${conn_conf}.suspended" "${conn_conf}"
+
+  swanctl --load-conns
   echo "client '${name}' unsuspended"
 }
 
@@ -618,7 +614,7 @@ cmd_set_routing() {
   fi
 
   apply_routing "${name}" "${mode}"
-  swanctl --load-all --clear
+  swanctl --load-conns --clear
   echo "${name}: routing set to ${mode}"
 }
 

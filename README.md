@@ -108,7 +108,7 @@ sudo rwctl suspend <name>
 sudo rwctl unsuspend <name>
 ```
 
-Suspend blocks the client from connecting by moving their cert out of the trusted store. Active session is terminated immediately but other clients are unaffected.
+Suspend blocks the client from connecting by removing their connection config. Active session is terminated immediately but other clients are unaffected.
 
 ### Revoke a client
 
