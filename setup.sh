@@ -92,6 +92,12 @@ if [[ -z "${ON_DEMAND_CELLULAR:-}" ]]; then
   ON_DEMAND_CELLULAR="${ON_DEMAND_CELLULAR:-yes}"
 fi
 
+# strongswan defaults to `unique_ids="yes"`` which means only one connection per client. This is sensible,
+# but there maybe reasons for allowing multiple.
+if [[ -z "${MULTI_DEVICE:-}" ]]; then
+  read -r -p "Allow multiple simultaneous connections per client? [y/N]: " MULTI_DEVICE
+fi
+
 # -s to hide password input
 if [[ -z "${CERT_PASSWORD:-}" ]]; then
   read -r -s -p "Fallback PKCS12 password for client bundles: " CERT_PASSWORD
@@ -171,8 +177,10 @@ esac
 UPDOWN
 chmod 755 "${SWANCTL_DIR}/updown.sh"
 
-# swanctl.conf. Now pools only. per-client connections handled by rwctl. (conf.d/client-<name>.conf)
+# swanctl.conf. Now pools only, with per-client connections loaded via include from conf.d/
 cat > "${SWANCTL_DIR}/swanctl.conf" <<SWANCTL
+include conf.d/*.conf
+
 pools {
   rw_pool {
     addrs = ${VPN_RANGE}
@@ -195,6 +203,17 @@ ON_DEMAND_TRUSTED_SSIDS="${ON_DEMAND_TRUSTED_SSIDS:-}"
 ON_DEMAND_CELLULAR="${ON_DEMAND_CELLULAR:-yes}"
 RWCONF
 chmod 600 "${SWANCTL_DIR}/roadwarrior.conf"
+
+if [[ "${MULTI_DEVICE,,}" == "y" || "${MULTI_DEVICE,,}" == "yes" ]]; then
+  unique_ids="no"
+else
+  unique_ids="yes"
+fi
+cat > /etc/strongswan.d/charon/roadwarrior.conf <<CHARON
+charon {
+    uniqueIDs = ${unique_ids}
+}
+CHARON
 
 # IP forward
 sysctl -w net.ipv4.ip_forward=1 > /dev/null
