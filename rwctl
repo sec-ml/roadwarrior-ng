@@ -474,6 +474,9 @@ cmd_revoke() {
     echo "aborted"; exit 0
   fi
 
+  # specifically terminate session. Previous method didn't stop active connections.
+  swanctl --terminate --ike "rw-${name}" 2>/dev/null || true
+
   rm -f "${SWANCTL_DIR}/private/client_${name}Key.pem"
   rm -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem"
   rm -f "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
@@ -482,8 +485,8 @@ cmd_revoke() {
   rm -f "${SWANCTL_DIR}/conf.d/routing-${name}.conf"
   rm -rf "${SWANCTL_DIR}/dist/${name}"
 
-  # reload conns & creds. --clear terminates now orphaned SAs. No other clients *should* be affected...
-  swanctl --load-all --clear
+  # reload configs. Existing connections shouldn't be affected...
+  swanctl --load-all
   echo "client '${name}' removed"
 }
 
@@ -570,6 +573,9 @@ cmd_suspend() {
   [[ -f "${SWANCTL_DIR}/x509/client_${name}Cert.pem" ]] \
     || { echo "client '${name}' is already suspended"; exit 0; }
 
+  # specifically terminate session. Previous method didn't stop active connections.
+  swanctl --terminate --ike "rw-${name}" 2>/dev/null || true
+
   mkdir -p "${SWANCTL_DIR}/x509suspended"
   mv "${SWANCTL_DIR}/x509/client_${name}Cert.pem" \
      "${SWANCTL_DIR}/x509suspended/client_${name}Cert.pem"
@@ -577,8 +583,8 @@ cmd_suspend() {
   local conn_conf="${SWANCTL_DIR}/conf.d/client-${name}.conf"
   [[ -f "${conn_conf}" ]] && mv "${conn_conf}" "${conn_conf}.suspended"
 
-  # reload connections. --clear only kills associations for this client (if any exist)
-  swanctl --load-conns --clear
+  # reload connections
+  swanctl --load-conns
   echo "client '${name}' suspended"
 }
 
