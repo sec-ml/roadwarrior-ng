@@ -1,6 +1,12 @@
 # Changelog
 
-## 1.0.4 - 2026-06-30
+## 1.0.5 - 2026-07-02
+
+- `include conf.d/*.conf` directive now gets added to swanctl.conf. Clients were not being allowed to connect without this
+- Add setup option to allow/deny multiple connections on the same clieny/cert
+- Fixed client suspend command
+
+## 1.0.4 - 2026-06-30 (no release)
 
 - Added CHANGELOG.md
 - Added release workflow (`.github/workflows/release.yml`)
